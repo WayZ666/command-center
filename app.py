@@ -37,40 +37,154 @@ DASH_HTML = """
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Command Center</title>
   <style>
-    body{font-family:system-ui;margin:24px}
-    .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;max-width:720px}
-    .card{border:1px solid #ddd;border-radius:12px;padding:14px}
-    .big{font-size:28px;font-weight:700}
-    .muted{color:#666}
-    @media(max-width:520px){.grid{grid-template-columns:1fr}}
-    table{border-collapse:collapse;width:100%;max-width:720px;margin-top:14px}
-    td,th{border-bottom:1px solid #eee;padding:10px;text-align:left;font-size:14px}
+    :root{
+      --bg:#070A12;
+      --panel:rgba(255,255,255,.06);
+      --panel2:rgba(255,255,255,.08);
+      --border:rgba(255,255,255,.12);
+      --text:rgba(255,255,255,.92);
+      --muted:rgba(255,255,255,.62);
+      --glow:rgba(80,160,255,.35);
+      --shadow: 0 16px 50px rgba(0,0,0,.55);
+      --radius:18px;
+    }
+    *{box-sizing:border-box}
+    body{
+      margin:0;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
+      background:
+        radial-gradient(900px 500px at 15% -10%, rgba(80,160,255,.22), transparent 60%),
+        radial-gradient(700px 420px at 85% 10%, rgba(160,80,255,.18), transparent 55%),
+        radial-gradient(900px 600px at 50% 120%, rgba(0,255,190,.10), transparent 55%),
+        var(--bg);
+      color:var(--text);
+      min-height:100vh;
+      padding:22px;
+    }
+    .wrap{max-width:980px;margin:0 auto}
+    .topbar{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:14px}
+    .title{line-height:1.05}
+    .title h1{margin:0;font-size:28px;letter-spacing:.4px;font-weight:800}
+    .title p{margin:8px 0 0 0;color:var(--muted);font-size:14px}
+    .badge{
+      background: linear-gradient(180deg, rgba(255,255,255,.10), rgba(255,255,255,.05));
+      border: 1px solid var(--border);
+      padding:10px 12px;border-radius:999px;box-shadow:var(--shadow);
+      backdrop-filter: blur(10px);
+      font-size:12px;color:var(--muted);white-space:nowrap
+    }
+    .grid{display:grid;grid-template-columns:repeat(12,1fr);gap:12px;margin-top:14px}
+    .card{
+      grid-column:span 6;
+      background: linear-gradient(180deg, var(--panel2), var(--panel));
+      border:1px solid var(--border);
+      border-radius:var(--radius);
+      padding:14px;
+      box-shadow:var(--shadow);
+      backdrop-filter: blur(10px);
+      position:relative;
+      overflow:hidden;
+    }
+    .card:before{
+      content:"";
+      position:absolute;inset:-2px;
+      background: radial-gradient(420px 120px at 10% 0%, rgba(80,160,255,.18), transparent 60%);
+      pointer-events:none;
+    }
+    .label{color:var(--muted);font-size:12px;letter-spacing:.6px;text-transform:uppercase}
+    .value{margin-top:6px;font-size:34px;font-weight:900;letter-spacing:.2px;text-shadow:0 0 22px var(--glow)}
+    .sub{margin-top:6px;color:var(--muted);font-size:12px}
+    .wide{grid-column:span 12}
+
+    .tablewrap{
+      background: linear-gradient(180deg, var(--panel2), var(--panel));
+      border:1px solid var(--border);
+      border-radius:var(--radius);
+      box-shadow:var(--shadow);
+      backdrop-filter: blur(10px);
+      overflow:hidden;
+    }
+    table{width:100%;border-collapse:collapse}
+    th,td{padding:12px 14px;font-size:13px;border-bottom:1px solid rgba(255,255,255,.08);text-align:left}
+    th{
+      color: rgba(255,255,255,.70);
+      letter-spacing:.6px;
+      text-transform:uppercase;
+      font-size:12px;
+      background: rgba(255,255,255,.04);
+    }
+    tr:hover td{background: rgba(255,255,255,.03)}
+    .footer{margin-top:14px;color: rgba(255,255,255,.45);font-size:12px}
+
+    @media (max-width: 720px){
+      .card{grid-column:span 12}
+      .title h1{font-size:24px}
+      .value{font-size:30px}
+    }
   </style>
 </head>
+
 <body>
-  <h1>🚀 Command Center</h1>
-  <p class="muted">Latest PC stats sent from your agent.</p>
+  <div class="wrap">
+    <div class="topbar">
+      <div class="title">
+        <h1>⚡ Command Center</h1>
+        <p>Live PC telemetry • remote dashboard</p>
+      </div>
+      <div class="badge">Service: command-center</div>
+    </div>
 
-  <div class="grid">
-    <div class="card"><div class="muted">CPU %</div><div class="big">{{cpu}}</div></div>
-    <div class="card"><div class="muted">RAM %</div><div class="big">{{ram}}</div></div>
-    <div class="card"><div class="muted">GPU %</div><div class="big">{{gpu}}</div></div>
-    <div class="card"><div class="muted">Last update</div><div class="big" style="font-size:18px">{{ts}}</div></div>
+    <div class="grid">
+      <div class="card">
+        <div class="label">CPU</div>
+        <div class="value">{{cpu}}%</div>
+        <div class="sub">Processor load</div>
+      </div>
+
+      <div class="card">
+        <div class="label">RAM</div>
+        <div class="value">{{ram}}%</div>
+        <div class="sub">Memory usage</div>
+      </div>
+
+      <div class="card">
+        <div class="label">GPU</div>
+        <div class="value">{{gpu}}</div>
+        <div class="sub">Next: real GPU %</div>
+      </div>
+
+      <div class="card">
+        <div class="label">Last Update (UTC)</div>
+        <div class="value" style="font-size:18px;text-shadow:none;font-weight:800;">{{ts}}</div>
+        <div class="sub">Agent heartbeat</div>
+      </div>
+
+      <div class="wide">
+        <div class="tablewrap">
+          <table>
+            <tr>
+              <th>Time (UTC)</th>
+              <th>CPU</th>
+              <th>RAM</th>
+              <th>GPU</th>
+              <th>Notes</th>
+            </tr>
+            {% for r in rows %}
+            <tr>
+              <td>{{r["ts"]}}</td>
+              <td>{{r["cpu"]}}</td>
+              <td>{{r["ram"]}}</td>
+              <td>{{r["gpu"]}}</td>
+              <td>{{r["notes"] or ""}}</td>
+            </tr>
+            {% endfor %}
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div class="footer">Tip: keep your agent running to keep the dashboard fresh.</div>
   </div>
-
-  <h2 style="margin-top:22px">Recent</h2>
-  <table>
-    <tr><th>Time (UTC)</th><th>CPU</th><th>RAM</th><th>GPU</th><th>Notes</th></tr>
-    {% for r in rows %}
-      <tr>
-        <td>{{r["ts"]}}</td>
-        <td>{{r["cpu"]}}</td>
-        <td>{{r["ram"]}}</td>
-        <td>{{r["gpu"]}}</td>
-        <td>{{r["notes"] or ""}}</td>
-      </tr>
-    {% endfor %}
-  </table>
 </body>
 </html>
 """
@@ -121,5 +235,6 @@ def ingest():
 @app.get("/health")
 def health():
     return jsonify({"status": "ok"})
+
 
 
