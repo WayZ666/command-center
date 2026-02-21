@@ -5,11 +5,9 @@ from datetime import datetime, timezone
 
 app = Flask(__name__)
 
-# ===== CONFIG =====
 API_KEY = os.environ.get("API_KEY", "dev-key-change-me")
 DB_PATH = "data.db"
 
-# ===== DATABASE =====
 def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -32,7 +30,6 @@ def init_db():
 
 init_db()
 
-# ===== DASHBOARD HTML =====
 DASH_HTML = """
 <!doctype html>
 <html>
@@ -78,7 +75,7 @@ DASH_HTML = """
 </html>
 """
 
-@app.route("/")
+@app.get("/")
 def home():
     conn = db()
     rows = conn.execute("SELECT ts,cpu,ram,gpu,notes FROM stats ORDER BY id DESC LIMIT 15").fetchall()
@@ -86,18 +83,20 @@ def home():
 
     if rows:
         latest = rows[0]
+        gpu_val = f'{latest["gpu"]:.1f}' if latest["gpu"] is not None else "—"
         return render_template_string(
             DASH_HTML,
             cpu=f'{latest["cpu"]:.1f}' if latest["cpu"] is not None else "—",
             ram=f'{latest["ram"]:.1f}' if latest["ram"] is not None else "—",
-            gpu=f'{latest["gpu"]:.1f}' if latest["gpu"] is not None else "—",
+            gpu=gpu_val,
             ts=latest["ts"],
             rows=rows,
         )
     return "No stats yet. Agent hasn’t sent anything."
 
-@app.route("/api/ingest", methods=["POST"])
+@app.post("/api/ingest")
 def ingest():
+    # ✅ This is the part that fixes your 405
     sent_key = request.headers.get("X-API-Key", "")
     if sent_key != API_KEY:
         return jsonify({"error": "unauthorized"}), 401
@@ -120,6 +119,7 @@ def ingest():
 
     return jsonify({"ok": True})
 
-@app.route("/health")
+@app.get("/health")
 def health():
     return jsonify({"status": "ok"})
+
