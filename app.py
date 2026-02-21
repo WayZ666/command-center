@@ -94,9 +94,8 @@ def home():
         )
     return "No stats yet. Agent hasn’t sent anything."
 
-@app.post("/api/ingest")
+@app.route("/api/ingest", methods=["POST"], strict_slashes=False)
 def ingest():
-    # ✅ This is the part that fixes your 405
     sent_key = request.headers.get("X-API-Key", "")
     if sent_key != API_KEY:
         return jsonify({"error": "unauthorized"}), 401
@@ -122,4 +121,5 @@ def ingest():
 @app.get("/health")
 def health():
     return jsonify({"status": "ok"})
+
 
