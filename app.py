@@ -310,7 +310,7 @@ def home():
         status_text=status_text,
         status_color=status_color,
 )
-   return "No stats yet. Agent hasn’t sent anything."
+    return "No stats yet. Agent hasn’t sent anything."
 
 @app.route("/api/ingest", methods=["POST"], strict_slashes=False)
 def ingest():
@@ -348,6 +348,7 @@ def api_stats():
 @app.get("/health")
 def health():
     return jsonify({"status": "ok"})
+
 
 
 
