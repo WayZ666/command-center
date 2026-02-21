@@ -139,7 +139,13 @@ DASH_HTML = """
         <h1>⚡ Command Center</h1>
         <p>Live PC telemetry • remote dashboard</p>
       </div>
-      <div class="badge">Service: command-center</div>
+      <div class="badge">
+  <span style="display:inline-flex;align-items:center;gap:8px;">
+    <span style="width:10px;height:10px;border-radius:999px;background: {{status_color}}; box-shadow: 0 0 16px {{status_color}};"></span>
+    <span style="font-weight:700; letter-spacing:.6px;">{{status_text}}</span>
+    <span style="opacity:.7;">• command-center</span>
+  </span>
+</div>
     </div>
 
     <div class="grid">
@@ -280,19 +286,29 @@ def home():
     ).fetchall()
     conn.close()
 
-    if rows:
-        latest = rows[0]
-        gpu_val = f'{latest["gpu"]:.1f}' if latest["gpu"] is not None else "—"
-        return render_template_string(
-            DASH_HTML,
-            cpu=f'{latest["cpu"]:.1f}' if latest["cpu"] is not None else "—",
-            ram=f'{latest["ram"]:.1f}' if latest["ram"] is not None else "—",
-            gpu=gpu_val,
-            ts=latest["ts"],
-            rows=rows,
-        )
+   if rows:
+    latest = rows[0]
+    gpu_val = f'{latest["gpu"]:.1f}' if latest["gpu"] is not None else "—"
 
-    return "No stats yet. Agent hasn’t sent anything."
+    # latest["ts"] is stored as UTC "YYYY-MM-DD HH:MM:SS"
+    latest_dt = datetime.strptime(latest["ts"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    age_seconds = (datetime.now(timezone.utc) - latest_dt).total_seconds()
+
+    is_live = age_seconds <= 15
+    status_text = "LIVE" if is_live else "OFFLINE"
+    status_color = "#38d996" if is_live else "#ff4d6d"  # green / red
+
+    return render_template_string(
+        DASH_HTML,
+        cpu=f'{latest["cpu"]:.1f}' if latest["cpu"] is not None else "—",
+        ram=f'{latest["ram"]:.1f}' if latest["ram"] is not None else "—",
+        gpu=gpu_val,
+        ts=latest["ts"],
+        rows=rows,
+        status_text=status_text,
+        status_color=status_color,
+    )
+        )
 
 @app.route("/api/ingest", methods=["POST"], strict_slashes=False)
 def ingest():
@@ -330,3 +346,4 @@ def api_stats():
 @app.get("/health")
 def health():
     return jsonify({"status": "ok"})
+
