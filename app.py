@@ -5,19 +5,20 @@ from datetime import datetime, timezone
 
 app = Flask(__name__)
 
-# ===== CONFIG =====
 API_KEY = os.environ.get("API_KEY", "dev-key-change-me")
 DB_PATH = "data.db"
 
-# ===== DB HELPERS =====
+
 def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
+
 def init_db():
     conn = db()
-    conn.execute("""
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS stats (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ts TEXT NOT NULL,
@@ -26,13 +27,14 @@ def init_db():
             gpu REAL,
             notes TEXT
         )
-    """)
+        """
+    )
     conn.commit()
     conn.close()
 
+
 init_db()
 
-# ===== UI (DARK / FUTURISTIC + LIVE CHART) =====
 DASH_HTML = """
 <!doctype html>
 <html>
@@ -98,10 +100,7 @@ DASH_HTML = """
     .value{margin-top:6px;font-size:34px;font-weight:900;letter-spacing:.2px;text-shadow:0 0 22px var(--glow)}
     .sub{margin-top:6px;color:var(--muted);font-size:12px}
     .wide{grid-column:span 12}
-    .chartwrap{
-      margin-top:10px;
-      height: 220px;
-    }
+    .chartwrap{margin-top:10px;height:220px}
 
     .tablewrap{
       background: linear-gradient(180deg, var(--panel2), var(--panel));
@@ -127,7 +126,7 @@ DASH_HTML = """
       .card{grid-column:span 12}
       .title h1{font-size:24px}
       .value{font-size:30px}
-      .chartwrap{height: 200px;}
+      .chartwrap{height:200px}
     }
   </style>
 </head>
@@ -139,18 +138,18 @@ DASH_HTML = """
         <h1>⚡ Command Center</h1>
         <p>Live PC telemetry • remote dashboard</p>
       </div>
+
       <div class="badge">
-  <span style="display:inline-flex;align-items:center;gap:8px;">
-    <span style="width:10px;height:10px;border-radius:999px;background: {{status_color}}; box-shadow: 0 0 16px {{status_color}};"></span>
-    <span style="font-weight:700; letter-spacing:.6px;">{{status_text}}</span>
-    <span style="opacity:.7;">• command-center</span>
-  </span>
-</div>
+        <span style="display:inline-flex;align-items:center;gap:8px;">
+          <span style="width:10px;height:10px;border-radius:999px;background: {{status_color}}; box-shadow: 0 0 16px {{status_color}};"></span>
+          <span style="font-weight:800; letter-spacing:.6px; color: rgba(255,255,255,.85);">{{status_text}}</span>
+          <span style="opacity:.7;">• command-center</span>
+        </span>
+      </div>
     </div>
 
     <div class="grid">
 
-      <!-- LIVE CHART -->
       <div class="card wide">
         <div class="label">Live Telemetry</div>
         <div class="sub">CPU & RAM history (updates every 5 seconds)</div>
@@ -159,7 +158,6 @@ DASH_HTML = """
         </div>
       </div>
 
-      <!-- METRIC CARDS -->
       <div class="card">
         <div class="label">CPU</div>
         <div class="value">{{cpu}}%</div>
@@ -184,7 +182,6 @@ DASH_HTML = """
         <div class="sub">Agent heartbeat</div>
       </div>
 
-      <!-- RECENT TABLE -->
       <div class="wide">
         <div class="tablewrap">
           <table>
@@ -212,7 +209,6 @@ DASH_HTML = """
     <div class="footer">Tip: keep your agent running to keep the dashboard fresh.</div>
   </div>
 
-  <!-- Chart.js + Live update -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <script>
     let chart;
@@ -259,10 +255,7 @@ DASH_HTML = """
       const cpuData = data.map(r => (r.cpu ?? null));
       const ramData = data.map(r => (r.ram ?? null));
 
-      if (!chart) {
-        buildChart(labels, cpuData, ramData);
-        return;
-      }
+      if (!chart) { buildChart(labels, cpuData, ramData); return; }
 
       chart.data.labels = labels;
       chart.data.datasets[0].data = cpuData;
@@ -277,7 +270,7 @@ DASH_HTML = """
 </html>
 """
 
-# ===== ROUTES =====
+
 @app.get("/")
 def home():
     conn = db()
@@ -286,31 +279,47 @@ def home():
     ).fetchall()
     conn.close()
 
-  if rows:
-    latest = rows[0]
-    gpu_val = f'{latest["gpu"]:.1f}' if latest["gpu"] is not None else "—"
+    # Default badge if nothing yet
+    status_text = "OFFLINE"
+    status_color = "#ff4d6d"
 
-    latest_dt = datetime.strptime(
-        latest["ts"], "%Y-%m-%d %H:%M:%S"
-    ).replace(tzinfo=timezone.utc)
+    if rows:
+        latest = rows[0]
+        gpu_val = f'{latest["gpu"]:.1f}' if latest["gpu"] is not None else "—"
 
-    age_seconds = (datetime.now(timezone.utc) - latest_dt).total_seconds()
+        latest_dt = datetime.strptime(
+            latest["ts"], "%Y-%m-%d %H:%M:%S"
+        ).replace(tzinfo=timezone.utc)
 
-    is_live = age_seconds <= 15
-    status_text = "LIVE" if is_live else "OFFLINE"
-    status_color = "#38d996" if is_live else "#ff4d6d"  # green / red
+        age_seconds = (datetime.now(timezone.utc) - latest_dt).total_seconds()
 
+        is_live = age_seconds <= 15
+        status_text = "LIVE" if is_live else "OFFLINE"
+        status_color = "#38d996" if is_live else "#ff4d6d"
+
+        return render_template_string(
+            DASH_HTML,
+            cpu=f'{latest["cpu"]:.1f}' if latest["cpu"] is not None else "—",
+            ram=f'{latest["ram"]:.1f}' if latest["ram"] is not None else "—",
+            gpu=gpu_val,
+            ts=latest["ts"],
+            rows=rows,
+            status_text=status_text,
+            status_color=status_color,
+        )
+
+    # If no rows yet, still render the UI (empty table, OFFLINE badge)
     return render_template_string(
         DASH_HTML,
-        cpu=f'{latest["cpu"]:.1f}' if latest["cpu"] is not None else "—",
-        ram=f'{latest["ram"]:.1f}' if latest["ram"] is not None else "—",
-        gpu=gpu_val,
-        ts=latest["ts"],
-        rows=rows,
+        cpu="—",
+        ram="—",
+        gpu="—",
+        ts="—",
+        rows=[],
         status_text=status_text,
         status_color=status_color,
-)
-    return "No stats yet. Agent hasn’t sent anything."
+    )
+
 
 @app.route("/api/ingest", methods=["POST"], strict_slashes=False)
 def ingest():
@@ -336,6 +345,7 @@ def ingest():
 
     return jsonify({"ok": True})
 
+
 @app.get("/api/stats")
 def api_stats():
     conn = db()
@@ -345,10 +355,7 @@ def api_stats():
     conn.close()
     return jsonify([dict(r) for r in rows])
 
+
 @app.get("/health")
 def health():
     return jsonify({"status": "ok"})
-
-
-
-
