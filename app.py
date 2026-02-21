@@ -5,9 +5,11 @@ from datetime import datetime, timezone
 
 app = Flask(__name__)
 
+# ===== CONFIG =====
 API_KEY = os.environ.get("API_KEY", "dev-key-change-me")
 DB_PATH = "data.db"
 
+# ===== DB HELPERS =====
 def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -30,6 +32,7 @@ def init_db():
 
 init_db()
 
+# ===== UI (DARK / FUTURISTIC + LIVE CHART) =====
 DASH_HTML = """
 <!doctype html>
 <html>
@@ -95,6 +98,10 @@ DASH_HTML = """
     .value{margin-top:6px;font-size:34px;font-weight:900;letter-spacing:.2px;text-shadow:0 0 22px var(--glow)}
     .sub{margin-top:6px;color:var(--muted);font-size:12px}
     .wide{grid-column:span 12}
+    .chartwrap{
+      margin-top:10px;
+      height: 220px;
+    }
 
     .tablewrap{
       background: linear-gradient(180deg, var(--panel2), var(--panel));
@@ -120,6 +127,7 @@ DASH_HTML = """
       .card{grid-column:span 12}
       .title h1{font-size:24px}
       .value{font-size:30px}
+      .chartwrap{height: 200px;}
     }
   </style>
 </head>
@@ -135,6 +143,17 @@ DASH_HTML = """
     </div>
 
     <div class="grid">
+
+      <!-- LIVE CHART -->
+      <div class="card wide">
+        <div class="label">Live Telemetry</div>
+        <div class="sub">CPU & RAM history (updates every 5 seconds)</div>
+        <div class="chartwrap">
+          <canvas id="telemetryChart"></canvas>
+        </div>
+      </div>
+
+      <!-- METRIC CARDS -->
       <div class="card">
         <div class="label">CPU</div>
         <div class="value">{{cpu}}%</div>
@@ -159,6 +178,7 @@ DASH_HTML = """
         <div class="sub">Agent heartbeat</div>
       </div>
 
+      <!-- RECENT TABLE -->
       <div class="wide">
         <div class="tablewrap">
           <table>
@@ -185,14 +205,79 @@ DASH_HTML = """
 
     <div class="footer">Tip: keep your agent running to keep the dashboard fresh.</div>
   </div>
+
+  <!-- Chart.js + Live update -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script>
+    let chart;
+
+    async function fetchStats() {
+      const res = await fetch("/api/stats", { cache: "no-store" });
+      return await res.json();
+    }
+
+    function labelFromTs(ts) {
+      // "YYYY-MM-DD HH:MM:SS" -> "HH:MM:SS"
+      return ts.slice(11);
+    }
+
+    function buildChart(labels, cpuData, ramData) {
+      const ctx = document.getElementById("telemetryChart").getContext("2d");
+      chart = new Chart(ctx, {
+        type: "line",
+        data: {
+          labels,
+          datasets: [
+            { label: "CPU %", data: cpuData, tension: 0.25, pointRadius: 0, borderWidth: 2 },
+            { label: "RAM %", data: ramData, tension: 0.25, pointRadius: 0, borderWidth: 2 }
+          ]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          animation: false,
+          plugins: { legend: { labels: { color: "rgba(255,255,255,0.75)" } } },
+          scales: {
+            x: { ticks: { color: "rgba(255,255,255,0.55)", maxTicksLimit: 8 }, grid: { color: "rgba(255,255,255,0.08)" } },
+            y: { suggestedMin: 0, suggestedMax: 100, ticks: { color: "rgba(255,255,255,0.55)" }, grid: { color: "rgba(255,255,255,0.08)" } }
+          }
+        }
+      });
+    }
+
+    async function updateChart() {
+      const rows = await fetchStats();      // newest first
+      const data = rows.slice().reverse();  // oldest -> newest
+
+      const labels = data.map(r => labelFromTs(r.ts));
+      const cpuData = data.map(r => (r.cpu ?? null));
+      const ramData = data.map(r => (r.ram ?? null));
+
+      if (!chart) {
+        buildChart(labels, cpuData, ramData);
+        return;
+      }
+
+      chart.data.labels = labels;
+      chart.data.datasets[0].data = cpuData;
+      chart.data.datasets[1].data = ramData;
+      chart.update();
+    }
+
+    updateChart();
+    setInterval(updateChart, 5000);
+  </script>
 </body>
 </html>
 """
 
+# ===== ROUTES =====
 @app.get("/")
 def home():
     conn = db()
-    rows = conn.execute("SELECT ts,cpu,ram,gpu,notes FROM stats ORDER BY id DESC LIMIT 15").fetchall()
+    rows = conn.execute(
+        "SELECT ts,cpu,ram,gpu,notes FROM stats ORDER BY id DESC LIMIT 15"
+    ).fetchall()
     conn.close()
 
     if rows:
@@ -206,6 +291,7 @@ def home():
             ts=latest["ts"],
             rows=rows,
         )
+
     return "No stats yet. Agent hasn’t sent anything."
 
 @app.route("/api/ingest", methods=["POST"], strict_slashes=False)
@@ -232,9 +318,15 @@ def ingest():
 
     return jsonify({"ok": True})
 
+@app.get("/api/stats")
+def api_stats():
+    conn = db()
+    rows = conn.execute(
+        "SELECT ts,cpu,ram,gpu,notes FROM stats ORDER BY id DESC LIMIT 200"
+    ).fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
 @app.get("/health")
 def health():
     return jsonify({"status": "ok"})
-
-
-
