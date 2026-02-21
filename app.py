@@ -286,12 +286,14 @@ def home():
     ).fetchall()
     conn.close()
 
-   if rows:
+  if rows:
     latest = rows[0]
     gpu_val = f'{latest["gpu"]:.1f}' if latest["gpu"] is not None else "—"
 
-    # latest["ts"] is stored as UTC "YYYY-MM-DD HH:MM:SS"
-    latest_dt = datetime.strptime(latest["ts"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    latest_dt = datetime.strptime(
+        latest["ts"], "%Y-%m-%d %H:%M:%S"
+    ).replace(tzinfo=timezone.utc)
+
     age_seconds = (datetime.now(timezone.utc) - latest_dt).total_seconds()
 
     is_live = age_seconds <= 15
@@ -307,7 +309,8 @@ def home():
         rows=rows,
         status_text=status_text,
         status_color=status_color,
-    )
+)
+   return "No stats yet. Agent hasn’t sent anything."
 
 @app.route("/api/ingest", methods=["POST"], strict_slashes=False)
 def ingest():
@@ -345,5 +348,6 @@ def api_stats():
 @app.get("/health")
 def health():
     return jsonify({"status": "ok"})
+
 
 
