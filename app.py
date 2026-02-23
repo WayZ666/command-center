@@ -5,20 +5,25 @@ from datetime import datetime, timezone
 
 app = Flask(__name__)
 
-# ========================
-# CONFIG
-# ========================
 API_KEY = os.environ.get("API_KEY", "dev-key-change-me")
 DB_PATH = "data.db"
 
 
-# ========================
-# DB
-# ========================
 def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def ensure_columns(conn, table: str, needed_cols: dict):
+    """
+    needed_cols: {"col_name": "SQLTYPE", ...}
+    Adds missing columns with ALTER TABLE (SQLite friendly migration).
+    """
+    existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    for col, sql_type in needed_cols.items():
+        if col not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {sql_type}")
 
 
 def init_db():
@@ -35,6 +40,16 @@ def init_db():
         )
         """
     )
+    # migrate: add disk columns if missing
+    ensure_columns(
+        conn,
+        "stats",
+        {
+            "disk_percent": "REAL",
+            "disk_used_gb": "REAL",
+            "disk_total_gb": "REAL",
+        },
+    )
     conn.commit()
     conn.close()
 
@@ -42,9 +57,25 @@ def init_db():
 init_db()
 
 
-# ========================
-# UI (Futuristic Dark + Live Charts + Live/Offline Badge)
-# ========================
+def health_label_color(pct):
+    """
+    Returns (label, color_hex) based on percent thresholds.
+    OK < 75, WARN 75-89.9, CRIT >= 90
+    """
+    if pct is None:
+        return ("—", "#9aa4b2")
+    try:
+        p = float(pct)
+    except Exception:
+        return ("—", "#9aa4b2")
+
+    if p >= 90:
+        return ("CRIT", "#ff4d6d")
+    if p >= 75:
+        return ("WARN", "#ffb020")
+    return ("OK", "#38d996")
+
+
 DASH_HTML = """
 <!doctype html>
 <html>
@@ -88,7 +119,6 @@ DASH_HTML = """
       backdrop-filter: blur(10px);
       font-size:12px;color:var(--muted);white-space:nowrap
     }
-
     .grid{display:grid;grid-template-columns:repeat(12,1fr);gap:12px;margin-top:14px}
     .card{
       grid-column:span 6;
@@ -112,6 +142,18 @@ DASH_HTML = """
     .sub{margin-top:6px;color:var(--muted);font-size:12px}
     .wide{grid-column:span 12}
     .chartwrap{margin-top:10px;height:220px}
+
+    .chips{display:flex;flex-wrap:wrap;gap:10px;margin-top:10px}
+    .chip{
+      display:inline-flex;align-items:center;gap:8px;
+      padding:10px 12px;border-radius:999px;
+      border:1px solid rgba(255,255,255,.14);
+      background: rgba(255,255,255,.06);
+      box-shadow: 0 10px 30px rgba(0,0,0,.35);
+      backdrop-filter: blur(10px);
+      font-size:12px;color: rgba(255,255,255,.78);
+    }
+    .dot{width:10px;height:10px;border-radius:999px}
 
     .tablewrap{
       background: linear-gradient(180deg, var(--panel2), var(--panel));
@@ -152,7 +194,7 @@ DASH_HTML = """
 
       <div class="badge">
         <span style="display:inline-flex;align-items:center;gap:8px;">
-          <span style="width:10px;height:10px;border-radius:999px;background: {{status_color}}; box-shadow: 0 0 16px {{status_color}};"></span>
+          <span class="dot" style="background: {{status_color}}; box-shadow: 0 0 16px {{status_color}};"></span>
           <span style="font-weight:800; letter-spacing:.6px; color: rgba(255,255,255,.85);">{{status_text}}</span>
           <span style="opacity:.7;">• command-center</span>
         </span>
@@ -162,8 +204,27 @@ DASH_HTML = """
     <div class="grid">
 
       <div class="card wide">
+        <div class="label">System Health</div>
+        <div class="sub">Quick status checks</div>
+        <div class="chips">
+          <div class="chip">
+            <span class="dot" style="background: {{cpu_health_color}}; box-shadow: 0 0 14px {{cpu_health_color}};"></span>
+            <span>CPU: <b>{{cpu_health}}</b></span>
+          </div>
+          <div class="chip">
+            <span class="dot" style="background: {{ram_health_color}}; box-shadow: 0 0 14px {{ram_health_color}};"></span>
+            <span>RAM: <b>{{ram_health}}</b></span>
+          </div>
+          <div class="chip">
+            <span class="dot" style="background: {{disk_health_color}}; box-shadow: 0 0 14px {{disk_health_color}};"></span>
+            <span>DISK: <b>{{disk_health}}</b></span>
+          </div>
+        </div>
+      </div>
+
+      <div class="card wide">
         <div class="label">Live Telemetry</div>
-        <div class="sub">CPU & RAM history (updates every 5 seconds)</div>
+        <div class="sub">CPU, RAM, DISK (updates every 5 seconds)</div>
         <div class="chartwrap">
           <canvas id="telemetryChart"></canvas>
         </div>
@@ -182,9 +243,9 @@ DASH_HTML = """
       </div>
 
       <div class="card">
-        <div class="label">GPU</div>
-        <div class="value">{{gpu}}</div>
-        <div class="sub">Next: real GPU %</div>
+        <div class="label">DISK</div>
+        <div class="value">{{disk_percent}}%</div>
+        <div class="sub">{{disk_used_gb}} GB used • {{disk_total_gb}} GB total</div>
       </div>
 
       <div class="card">
@@ -200,6 +261,7 @@ DASH_HTML = """
               <th>Time (UTC)</th>
               <th>CPU</th>
               <th>RAM</th>
+              <th>DISK%</th>
               <th>GPU</th>
               <th>Notes</th>
             </tr>
@@ -208,6 +270,7 @@ DASH_HTML = """
               <td>{{r["ts"]}}</td>
               <td>{{r["cpu"]}}</td>
               <td>{{r["ram"]}}</td>
+              <td>{{r["disk_percent"]}}</td>
               <td>{{r["gpu"]}}</td>
               <td>{{r["notes"] or ""}}</td>
             </tr>
@@ -229,12 +292,9 @@ DASH_HTML = """
       return await res.json();
     }
 
-    function labelFromTs(ts) {
-      // "YYYY-MM-DD HH:MM:SS" -> "HH:MM:SS"
-      return ts.slice(11);
-    }
+    function labelFromTs(ts) { return ts.slice(11); }
 
-    function buildChart(labels, cpuData, ramData) {
+    function buildChart(labels, cpuData, ramData, diskData) {
       const ctx = document.getElementById("telemetryChart").getContext("2d");
       chart = new Chart(ctx, {
         type: "line",
@@ -242,7 +302,8 @@ DASH_HTML = """
           labels,
           datasets: [
             { label: "CPU %", data: cpuData, tension: 0.25, pointRadius: 0, borderWidth: 2 },
-            { label: "RAM %", data: ramData, tension: 0.25, pointRadius: 0, borderWidth: 2 }
+            { label: "RAM %", data: ramData, tension: 0.25, pointRadius: 0, borderWidth: 2 },
+            { label: "DISK %", data: diskData, tension: 0.25, pointRadius: 0, borderWidth: 2 }
           ]
         },
         options: {
@@ -263,14 +324,16 @@ DASH_HTML = """
       const data = rows.slice().reverse();  // oldest -> newest
 
       const labels = data.map(r => labelFromTs(r.ts));
-      const cpuData = data.map(r => (r.cpu ?? null));
-      const ramData = data.map(r => (r.ram ?? null));
+      const cpuData  = data.map(r => (r.cpu ?? null));
+      const ramData  = data.map(r => (r.ram ?? null));
+      const diskData = data.map(r => (r.disk_percent ?? null));
 
-      if (!chart) { buildChart(labels, cpuData, ramData); return; }
+      if (!chart) { buildChart(labels, cpuData, ramData, diskData); return; }
 
       chart.data.labels = labels;
       chart.data.datasets[0].data = cpuData;
       chart.data.datasets[1].data = ramData;
+      chart.data.datasets[2].data = diskData;
       chart.update();
     }
 
@@ -282,47 +345,72 @@ DASH_HTML = """
 """
 
 
-# ========================
-# ROUTES
-# ========================
 @app.get("/")
 def home():
     conn = db()
     rows = conn.execute(
-        "SELECT ts,cpu,ram,gpu,notes FROM stats ORDER BY id DESC LIMIT 15"
+        """
+        SELECT ts,cpu,ram,gpu,notes,disk_percent,disk_used_gb,disk_total_gb
+        FROM stats
+        ORDER BY id DESC
+        LIMIT 15
+        """
     ).fetchall()
     conn.close()
 
-    # Default badge if nothing yet
+    # default UI state
     status_text = "OFFLINE"
     status_color = "#ff4d6d"
 
+    cpu_health, cpu_health_color = ("—", "#9aa4b2")
+    ram_health, ram_health_color = ("—", "#9aa4b2")
+    disk_health, disk_health_color = ("—", "#9aa4b2")
+
     if rows:
         latest = rows[0]
-        gpu_val = f'{latest["gpu"]:.1f}' if latest["gpu"] is not None else "—"
 
-        latest_dt = datetime.strptime(
-            latest["ts"], "%Y-%m-%d %H:%M:%S"
-        ).replace(tzinfo=timezone.utc)
-
+        # LIVE / OFFLINE
+        latest_dt = datetime.strptime(latest["ts"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
         age_seconds = (datetime.now(timezone.utc) - latest_dt).total_seconds()
-
         is_live = age_seconds <= 15
         status_text = "LIVE" if is_live else "OFFLINE"
         status_color = "#38d996" if is_live else "#ff4d6d"
 
+        # Health chips
+        cpu_health, cpu_health_color = health_label_color(latest["cpu"])
+        ram_health, ram_health_color = health_label_color(latest["ram"])
+        disk_health, disk_health_color = health_label_color(latest["disk_percent"])
+
+        # Format display values
+        cpu_v = f'{latest["cpu"]:.1f}' if latest["cpu"] is not None else "—"
+        ram_v = f'{latest["ram"]:.1f}' if latest["ram"] is not None else "—"
+        gpu_v = f'{latest["gpu"]:.1f}' if latest["gpu"] is not None else "—"
+
+        disk_p = f'{latest["disk_percent"]:.1f}' if latest["disk_percent"] is not None else "—"
+        disk_used = f'{latest["disk_used_gb"]:.1f}' if latest["disk_used_gb"] is not None else "—"
+        disk_total = f'{latest["disk_total_gb"]:.1f}' if latest["disk_total_gb"] is not None else "—"
+
         return render_template_string(
             DASH_HTML,
-            cpu=f'{latest["cpu"]:.1f}' if latest["cpu"] is not None else "—",
-            ram=f'{latest["ram"]:.1f}' if latest["ram"] is not None else "—",
-            gpu=gpu_val,
+            cpu=cpu_v,
+            ram=ram_v,
+            gpu=gpu_v,
             ts=latest["ts"],
             rows=rows,
             status_text=status_text,
             status_color=status_color,
+            cpu_health=cpu_health,
+            cpu_health_color=cpu_health_color,
+            ram_health=ram_health,
+            ram_health_color=ram_health_color,
+            disk_health=disk_health,
+            disk_health_color=disk_health_color,
+            disk_percent=disk_p,
+            disk_used_gb=disk_used,
+            disk_total_gb=disk_total,
         )
 
-    # No data yet: still render the UI (empty table)
+    # No rows yet: still render UI
     return render_template_string(
         DASH_HTML,
         cpu="—",
@@ -332,6 +420,15 @@ def home():
         rows=[],
         status_text=status_text,
         status_color=status_color,
+        cpu_health=cpu_health,
+        cpu_health_color=cpu_health_color,
+        ram_health=ram_health,
+        ram_health_color=ram_health_color,
+        disk_health=disk_health,
+        disk_health_color=disk_health_color,
+        disk_percent="—",
+        disk_used_gb="—",
+        disk_total_gb="—",
     )
 
 
@@ -342,17 +439,25 @@ def ingest():
         return jsonify({"error": "unauthorized"}), 401
 
     data = request.get_json(silent=True) or {}
+
     cpu = data.get("cpu")
     ram = data.get("ram")
     gpu = data.get("gpu")
     notes = data.get("notes")
 
+    disk_percent = data.get("disk_percent")
+    disk_used_gb = data.get("disk_used_gb")
+    disk_total_gb = data.get("disk_total_gb")
+
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
     conn = db()
     conn.execute(
-        "INSERT INTO stats (ts,cpu,ram,gpu,notes) VALUES (?,?,?,?,?)",
-        (ts, cpu, ram, gpu, notes),
+        """
+        INSERT INTO stats (ts,cpu,ram,gpu,notes,disk_percent,disk_used_gb,disk_total_gb)
+        VALUES (?,?,?,?,?,?,?,?)
+        """,
+        (ts, cpu, ram, gpu, notes, disk_percent, disk_used_gb, disk_total_gb),
     )
     conn.commit()
     conn.close()
@@ -364,7 +469,12 @@ def ingest():
 def api_stats():
     conn = db()
     rows = conn.execute(
-        "SELECT ts,cpu,ram,gpu,notes FROM stats ORDER BY id DESC LIMIT 200"
+        """
+        SELECT ts,cpu,ram,gpu,notes,disk_percent,disk_used_gb,disk_total_gb
+        FROM stats
+        ORDER BY id DESC
+        LIMIT 200
+        """
     ).fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
