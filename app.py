@@ -1,361 +1,382 @@
-from flask import Flask, jsonify, request, render_template_string
+import json
 import os
 import sqlite3
-from datetime import datetime, timezone
+import time
+from datetime import datetime
+
+from flask import Flask, jsonify, request, Response
+
+# =========================
+# CONFIG
+# =========================
+API_KEY = os.environ.get("COMMAND_CENTER_API_KEY", "MiguelCommandCenterSecure928374")
+DB_PATH = os.environ.get("COMMAND_CENTER_DB", "telemetry.db")
+
+OFFLINE_AFTER_SECONDS = 30  # mark PC offline if no ingest within this window
 
 app = Flask(__name__)
 
-API_KEY = os.environ.get("API_KEY", "dev-key-change-me")
-DB_PATH = "data.db"
+# in-memory latest snapshot per PC for fast dashboard
+LATEST = {}  # pc -> {"ts": int, "payload": dict}
 
 
-def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+# =========================
+# DB
+# =========================
+def db_conn():
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    return con
 
 
 def init_db():
-    conn = db()
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS stats (
+    with db_conn() as con:
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS readings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts TEXT NOT NULL,
-            cpu REAL,
-            ram REAL,
-            gpu REAL,
-            notes TEXT
+            pc TEXT NOT NULL,
+            ts INTEGER NOT NULL,
+            payload TEXT NOT NULL
         )
-        """
-    )
-    conn.commit()
-    conn.close()
+        """)
+        con.execute("CREATE INDEX IF NOT EXISTS idx_pc_ts ON readings(pc, ts)")
+
+
+def prune_old(days=7):
+    cutoff = int(time.time()) - (days * 86400)
+    with db_conn() as con:
+        con.execute("DELETE FROM readings WHERE ts < ?", (cutoff,))
 
 
 init_db()
 
-DASH_HTML = """
-<!doctype html>
-<html>
-<head>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Command Center</title>
-  <style>
-    :root{
-      --bg:#070A12;
-      --panel:rgba(255,255,255,.06);
-      --panel2:rgba(255,255,255,.08);
-      --border:rgba(255,255,255,.12);
-      --text:rgba(255,255,255,.92);
-      --muted:rgba(255,255,255,.62);
-      --glow:rgba(80,160,255,.35);
-      --shadow: 0 16px 50px rgba(0,0,0,.55);
-      --radius:18px;
-    }
-    *{box-sizing:border-box}
-    body{
-      margin:0;
-      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
-      background:
-        radial-gradient(900px 500px at 15% -10%, rgba(80,160,255,.22), transparent 60%),
-        radial-gradient(700px 420px at 85% 10%, rgba(160,80,255,.18), transparent 55%),
-        radial-gradient(900px 600px at 50% 120%, rgba(0,255,190,.10), transparent 55%),
-        var(--bg);
-      color:var(--text);
-      min-height:100vh;
-      padding:22px;
-    }
-    .wrap{max-width:980px;margin:0 auto}
-    .topbar{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:14px}
-    .title{line-height:1.05}
-    .title h1{margin:0;font-size:28px;letter-spacing:.4px;font-weight:800}
-    .title p{margin:8px 0 0 0;color:var(--muted);font-size:14px}
-    .badge{
-      background: linear-gradient(180deg, rgba(255,255,255,.10), rgba(255,255,255,.05));
-      border: 1px solid var(--border);
-      padding:10px 12px;border-radius:999px;box-shadow:var(--shadow);
-      backdrop-filter: blur(10px);
-      font-size:12px;color:var(--muted);white-space:nowrap
-    }
-    .grid{display:grid;grid-template-columns:repeat(12,1fr);gap:12px;margin-top:14px}
-    .card{
-      grid-column:span 6;
-      background: linear-gradient(180deg, var(--panel2), var(--panel));
-      border:1px solid var(--border);
-      border-radius:var(--radius);
-      padding:14px;
-      box-shadow:var(--shadow);
-      backdrop-filter: blur(10px);
-      position:relative;
-      overflow:hidden;
-    }
-    .card:before{
-      content:"";
-      position:absolute;inset:-2px;
-      background: radial-gradient(420px 120px at 10% 0%, rgba(80,160,255,.18), transparent 60%);
-      pointer-events:none;
-    }
-    .label{color:var(--muted);font-size:12px;letter-spacing:.6px;text-transform:uppercase}
-    .value{margin-top:6px;font-size:34px;font-weight:900;letter-spacing:.2px;text-shadow:0 0 22px var(--glow)}
-    .sub{margin-top:6px;color:var(--muted);font-size:12px}
-    .wide{grid-column:span 12}
-    .chartwrap{margin-top:10px;height:220px}
 
-    .tablewrap{
-      background: linear-gradient(180deg, var(--panel2), var(--panel));
-      border:1px solid var(--border);
-      border-radius:var(--radius);
-      box-shadow:var(--shadow);
-      backdrop-filter: blur(10px);
-      overflow:hidden;
-    }
-    table{width:100%;border-collapse:collapse}
-    th,td{padding:12px 14px;font-size:13px;border-bottom:1px solid rgba(255,255,255,.08);text-align:left}
-    th{
-      color: rgba(255,255,255,.70);
-      letter-spacing:.6px;
-      text-transform:uppercase;
-      font-size:12px;
-      background: rgba(255,255,255,.04);
-    }
-    tr:hover td{background: rgba(255,255,255,.03)}
-    .footer{margin-top:14px;color: rgba(255,255,255,.45);font-size:12px}
-
-    @media (max-width: 720px){
-      .card{grid-column:span 12}
-      .title h1{font-size:24px}
-      .value{font-size:30px}
-      .chartwrap{height:200px}
-    }
-  </style>
-</head>
-
-<body>
-  <div class="wrap">
-    <div class="topbar">
-      <div class="title">
-        <h1>⚡ Command Center</h1>
-        <p>Live PC telemetry • remote dashboard</p>
-      </div>
-
-      <div class="badge">
-        <span style="display:inline-flex;align-items:center;gap:8px;">
-          <span style="width:10px;height:10px;border-radius:999px;background: {{status_color}}; box-shadow: 0 0 16px {{status_color}};"></span>
-          <span style="font-weight:800; letter-spacing:.6px; color: rgba(255,255,255,.85);">{{status_text}}</span>
-          <span style="opacity:.7;">• command-center</span>
-        </span>
-      </div>
-    </div>
-
-    <div class="grid">
-
-      <div class="card wide">
-        <div class="label">Live Telemetry</div>
-        <div class="sub">CPU & RAM history (updates every 5 seconds)</div>
-        <div class="chartwrap">
-          <canvas id="telemetryChart"></canvas>
-        </div>
-      </div>
-
-      <div class="card">
-        <div class="label">CPU</div>
-        <div class="value">{{cpu}}%</div>
-        <div class="sub">Processor load</div>
-      </div>
-
-      <div class="card">
-        <div class="label">RAM</div>
-        <div class="value">{{ram}}%</div>
-        <div class="sub">Memory usage</div>
-      </div>
-
-      <div class="card">
-        <div class="label">GPU</div>
-        <div class="value">{{gpu}}</div>
-        <div class="sub">Next: real GPU %</div>
-      </div>
-
-      <div class="card">
-        <div class="label">Last Update (UTC)</div>
-        <div class="value" style="font-size:18px;text-shadow:none;font-weight:800;">{{ts}}</div>
-        <div class="sub">Agent heartbeat</div>
-      </div>
-
-      <div class="wide">
-        <div class="tablewrap">
-          <table>
-            <tr>
-              <th>Time (UTC)</th>
-              <th>CPU</th>
-              <th>RAM</th>
-              <th>GPU</th>
-              <th>Notes</th>
-            </tr>
-            {% for r in rows %}
-            <tr>
-              <td>{{r["ts"]}}</td>
-              <td>{{r["cpu"]}}</td>
-              <td>{{r["ram"]}}</td>
-              <td>{{r["gpu"]}}</td>
-              <td>{{r["notes"] or ""}}</td>
-            </tr>
-            {% endfor %}
-          </table>
-        </div>
-      </div>
-    </div>
-
-    <div class="footer">Tip: keep your agent running to keep the dashboard fresh.</div>
-  </div>
-
-  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-  <script>
-    let chart;
-
-    async function fetchStats() {
-      const res = await fetch("/api/stats", { cache: "no-store" });
-      return await res.json();
-    }
-
-    function labelFromTs(ts) {
-      // "YYYY-MM-DD HH:MM:SS" -> "HH:MM:SS"
-      return ts.slice(11);
-    }
-
-    function buildChart(labels, cpuData, ramData) {
-      const ctx = document.getElementById("telemetryChart").getContext("2d");
-      chart = new Chart(ctx, {
-        type: "line",
-        data: {
-          labels,
-          datasets: [
-            { label: "CPU %", data: cpuData, tension: 0.25, pointRadius: 0, borderWidth: 2 },
-            { label: "RAM %", data: ramData, tension: 0.25, pointRadius: 0, borderWidth: 2 }
-          ]
-        },
-        options: {
-          responsive: true,
-          maintainAspectRatio: false,
-          animation: false,
-          plugins: { legend: { labels: { color: "rgba(255,255,255,0.75)" } } },
-          scales: {
-            x: { ticks: { color: "rgba(255,255,255,0.55)", maxTicksLimit: 8 }, grid: { color: "rgba(255,255,255,0.08)" } },
-            y: { suggestedMin: 0, suggestedMax: 100, ticks: { color: "rgba(255,255,255,0.55)" }, grid: { color: "rgba(255,255,255,0.08)" } }
-          }
-        }
-      });
-    }
-
-    async function updateChart() {
-      const rows = await fetchStats();      // newest first
-      const data = rows.slice().reverse();  // oldest -> newest
-
-      const labels = data.map(r => labelFromTs(r.ts));
-      const cpuData = data.map(r => (r.cpu ?? null));
-      const ramData = data.map(r => (r.ram ?? null));
-
-      if (!chart) { buildChart(labels, cpuData, ramData); return; }
-
-      chart.data.labels = labels;
-      chart.data.datasets[0].data = cpuData;
-      chart.data.datasets[1].data = ramData;
-      chart.update();
-    }
-
-    updateChart();
-    setInterval(updateChart, 5000);
-  </script>
-</body>
-</html>
-"""
+# =========================
+# HELPERS
+# =========================
+def is_auth_ok(data: dict) -> bool:
+    # allow either header or json api_key
+    header_key = request.headers.get("X-API-KEY")
+    body_key = (data or {}).get("api_key")
+    return (header_key == API_KEY) or (body_key == API_KEY)
 
 
-@app.get("/")
-def home():
-    conn = db()
-    rows = conn.execute(
-        "SELECT ts,cpu,ram,gpu,notes FROM stats ORDER BY id DESC LIMIT 15"
-    ).fetchall()
-    conn.close()
+def pc_online(last_ts: int) -> bool:
+    return (int(time.time()) - int(last_ts)) <= OFFLINE_AFTER_SECONDS
 
-    # Default badge if nothing yet
-    status_text = "OFFLINE"
-    status_color = "#ff4d6d"
 
-    if rows:
-        latest = rows[0]
-        gpu_val = f'{latest["gpu"]:.1f}' if latest["gpu"] is not None else "—"
+def extract_metric(payload: dict, metric: str):
+    # CPU + RAM
+    if metric == "cpu_pct":
+        return payload.get("cpu", {}).get("usage_pct")
 
-        latest_dt = datetime.strptime(
-            latest["ts"], "%Y-%m-%d %H:%M:%S"
-        ).replace(tzinfo=timezone.utc)
+    if metric == "ram_pct":
+        return payload.get("ram", {}).get("used_pct")
 
-        age_seconds = (datetime.now(timezone.utc) - latest_dt).total_seconds()
+    # Disk usage (C:)
+    if metric == "disk_c_used_pct":
+        disk = payload.get("disk", {})
+        for p in disk.get("partitions", []):
+            mp = str(p.get("mountpoint", "")).upper()
+            if mp.startswith("C:"):
+                return p.get("used_pct")
+        return None
 
-        is_live = age_seconds <= 15
-        status_text = "LIVE" if is_live else "OFFLINE"
-        status_color = "#38d996" if is_live else "#ff4d6d"
+    # Total IO (lifetime counters, still useful trend if sampled)
+    if metric == "disk_read_mb":
+        return payload.get("disk", {}).get("io", {}).get("read_mb")
 
-        return render_template_string(
-            DASH_HTML,
-            cpu=f'{latest["cpu"]:.1f}' if latest["cpu"] is not None else "—",
-            ram=f'{latest["ram"]:.1f}' if latest["ram"] is not None else "—",
-            gpu=gpu_val,
-            ts=latest["ts"],
-            rows=rows,
-            status_text=status_text,
-            status_color=status_color,
+    if metric == "disk_write_mb":
+        return payload.get("disk", {}).get("io", {}).get("write_mb")
+
+    # Uptime
+    if metric == "uptime_seconds":
+        return payload.get("uptime", {}).get("uptime_seconds")
+
+    return None
+
+
+# =========================
+# ROUTES
+# =========================
+@app.route("/api/ingest", methods=["POST"])
+def ingest():
+    data = request.get_json(force=True, silent=True) or {}
+
+    if not is_auth_ok(data):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    pc = data.get("pc_name") or data.get("pc") or "Unknown"
+    ts = int(data.get("ts") or time.time())
+
+    # store raw payload
+    with db_conn() as con:
+        con.execute(
+            "INSERT INTO readings (pc, ts, payload) VALUES (?, ?, ?)",
+            (pc, ts, json.dumps(data))
         )
 
-    # If no rows yet, still render the UI (empty table, OFFLINE badge)
-    return render_template_string(
-        DASH_HTML,
-        cpu="—",
-        ram="—",
-        gpu="—",
-        ts="—",
-        rows=[],
-        status_text=status_text,
-        status_color=status_color,
-    )
+    # update latest cache
+    LATEST[pc] = {"ts": ts, "payload": data}
 
-
-@app.route("/api/ingest", methods=["POST"], strict_slashes=False)
-def ingest():
-    sent_key = request.headers.get("X-API-Key", "")
-    if sent_key != API_KEY:
-        return jsonify({"error": "unauthorized"}), 401
-
-    data = request.get_json(silent=True) or {}
-    cpu = data.get("cpu")
-    ram = data.get("ram")
-    gpu = data.get("gpu")
-    notes = data.get("notes")
-
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-
-    conn = db()
-    conn.execute(
-        "INSERT INTO stats (ts,cpu,ram,gpu,notes) VALUES (?,?,?,?,?)",
-        (ts, cpu, ram, gpu, notes),
-    )
-    conn.commit()
-    conn.close()
+    # occasional pruning
+    if ts % 300 < 2:  # roughly every 5 minutes depending on ingest timing
+        try:
+            prune_old(days=7)
+        except Exception:
+            pass
 
     return jsonify({"ok": True})
 
 
-@app.get("/api/stats")
-def api_stats():
-    conn = db()
-    rows = conn.execute(
-        "SELECT ts,cpu,ram,gpu,notes FROM stats ORDER BY id DESC LIMIT 200"
-    ).fetchall()
-    conn.close()
-    return jsonify([dict(r) for r in rows])
+@app.route("/api/latest", methods=["GET"])
+def api_latest():
+    now = int(time.time())
+
+    out = {}
+    for pc, item in LATEST.items():
+        last_ts = int(item["ts"])
+        out[pc] = {
+            "online": (now - last_ts) <= OFFLINE_AFTER_SECONDS,
+            "last_ts": last_ts,
+            "last_iso": datetime.utcfromtimestamp(last_ts).isoformat() + "Z",
+            "payload": item["payload"],
+        }
+    return jsonify(out)
 
 
-@app.get("/health")
-def health():
-    return jsonify({"status": "ok"})
+@app.route("/api/history", methods=["GET"])
+def api_history():
+    pc = request.args.get("pc", "")
+    metric = request.args.get("metric", "cpu_pct")
+    hours = float(request.args.get("hours", "24"))
+
+    if not pc:
+        return jsonify({"ok": False, "error": "pc required"}), 400
+
+    now = int(time.time())
+    start = now - int(hours * 3600)
+
+    with db_conn() as con:
+        rows = con.execute(
+            "SELECT ts, payload FROM readings WHERE pc=? AND ts>=? ORDER BY ts ASC",
+            (pc, start)
+        ).fetchall()
+
+    points = []
+    for r in rows:
+        ts = int(r["ts"])
+        try:
+            payload = json.loads(r["payload"])
+        except Exception:
+            continue
+
+        val = extract_metric(payload, metric)
+        if val is None:
+            continue
+        points.append({"ts": ts, "value": val})
+
+    return jsonify({
+        "pc": pc,
+        "metric": metric,
+        "hours": hours,
+        "points": points
+    })
+
+
+# =========================
+# SIMPLE DASHBOARD (NO TEMPLATE FILES NEEDED)
+# =========================
+@app.route("/", methods=["GET"])
+def dashboard():
+    html = f"""
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Command Center</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body {{ font-family: Arial, sans-serif; margin: 18px; }}
+    .row {{ display: flex; gap: 18px; flex-wrap: wrap; }}
+    .card {{ border: 1px solid #ddd; border-radius: 10px; padding: 14px; min-width: 320px; flex: 1; }}
+    .pill {{ display:inline-block; padding: 4px 10px; border-radius: 999px; font-size: 12px; }}
+    .ok {{ background:#e8fff0; border:1px solid #9be7b3; }}
+    .bad {{ background:#ffecec; border:1px solid #f3a7a7; }}
+    select,input {{ padding: 8px; border-radius: 8px; border: 1px solid #ccc; }}
+    canvas {{ width: 100% !important; height: 260px !important; }}
+    .muted {{ color:#666; font-size: 12px; }}
+  </style>
+</head>
+<body>
+  <h2>Command Center</h2>
+
+  <div class="card" style="max-width:900px;">
+    <div class="row" style="align-items:center;">
+      <div>
+        <div class="muted">PC</div>
+        <select id="pcSelect"></select>
+      </div>
+
+      <div>
+        <div class="muted">Metric</div>
+        <select id="metricSelect">
+          <option value="cpu_pct">CPU %</option>
+          <option value="ram_pct">RAM %</option>
+          <option value="disk_c_used_pct">Disk C: Used %</option>
+          <option value="disk_read_mb">Disk Read MB (total)</option>
+          <option value="disk_write_mb">Disk Write MB (total)</option>
+          <option value="uptime_seconds">Uptime (seconds)</option>
+        </select>
+      </div>
+
+      <div>
+        <div class="muted">Hours</div>
+        <input id="hoursInput" type="number" value="24" min="1" max="168" />
+      </div>
+
+      <div style="flex:1;">
+        <div class="muted">Status</div>
+        <div id="statusLine">Loading...</div>
+      </div>
+
+      <div>
+        <button id="refreshBtn" style="padding:8px 12px; border-radius:10px; border:1px solid #ccc; cursor:pointer;">
+          Refresh
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <div class="row" style="margin-top:18px;">
+    <div class="card">
+      <h3 style="margin-top:0;">Historical Graph</h3>
+      <canvas id="chart"></canvas>
+    </div>
+
+    <div class="card">
+      <h3 style="margin-top:0;">Live Snapshot</h3>
+      <pre id="liveJson" style="white-space:pre-wrap;"></pre>
+    </div>
+  </div>
+
+<script>
+let chart;
+
+function pill(online) {{
+  return online
+    ? '<span class="pill ok">LIVE</span>'
+    : '<span class="pill bad">OFFLINE</span>';
+}}
+
+async function fetchLatest() {{
+  const res = await fetch('/api/latest');
+  return await res.json();
+}}
+
+async function fetchHistory(pc, metric, hours) {{
+  const res = await fetch(`/api/history?pc=${{encodeURIComponent(pc)}}&metric=${{encodeURIComponent(metric)}}&hours=${{hours}}`);
+  return await res.json();
+}}
+
+function ensureChart(labels, values, metric) {{
+  const ctx = document.getElementById('chart').getContext('2d');
+  if (!chart) {{
+    chart = new Chart(ctx, {{
+      type: 'line',
+      data: {{
+        labels,
+        datasets: [{{
+          label: metric,
+          data: values,
+          tension: 0.2
+        }}]
+      }},
+      options: {{
+        responsive: true,
+        animation: false,
+        scales: {{
+          y: {{
+            beginAtZero: true
+          }}
+        }}
+      }}
+    }});
+  }} else {{
+    chart.data.labels = labels;
+    chart.data.datasets[0].label = metric;
+    chart.data.datasets[0].data = values;
+    chart.update();
+  }}
+}}
+
+function tsToLabel(ts) {{
+  const d = new Date(ts * 1000);
+  return d.toLocaleTimeString();
+}}
+
+async function populatePCs(latest) {{
+  const select = document.getElementById('pcSelect');
+  const pcs = Object.keys(latest);
+  select.innerHTML = '';
+  pcs.forEach(pc => {{
+    const opt = document.createElement('option');
+    opt.value = pc;
+    opt.textContent = pc;
+    select.appendChild(opt);
+  }});
+  if (pcs.length === 0) {{
+    const opt = document.createElement('option');
+    opt.value = '';
+    opt.textContent = 'No PCs yet';
+    select.appendChild(opt);
+  }}
+}}
+
+async function refreshAll() {{
+  const latest = await fetchLatest();
+  await populatePCs(latest);
+
+  const pc = document.getElementById('pcSelect').value;
+  const metric = document.getElementById('metricSelect').value;
+  const hours = document.getElementById('hoursInput').value || 24;
+
+  if (!pc || !latest[pc]) {{
+    document.getElementById('statusLine').innerHTML = 'No telemetry received yet.';
+    document.getElementById('liveJson').textContent = '';
+    return;
+  }}
+
+  const info = latest[pc];
+  document.getElementById('statusLine').innerHTML =
+    `${{pill(info.online)}} <span class="muted">Last:</span> ${{info.last_iso}}`;
+
+  document.getElementById('liveJson').textContent =
+    JSON.stringify(info.payload, null, 2);
+
+  const hist = await fetchHistory(pc, metric, hours);
+  const labels = hist.points.map(p => tsToLabel(p.ts));
+  const values = hist.points.map(p => p.value);
+
+  ensureChart(labels, values, metric);
+}}
+
+document.getElementById('refreshBtn').addEventListener('click', refreshAll);
+document.getElementById('pcSelect').addEventListener('change', refreshAll);
+document.getElementById('metricSelect').addEventListener('change', refreshAll);
+document.getElementById('hoursInput').addEventListener('change', refreshAll);
+
+refreshAll();
+setInterval(refreshAll, 5000);
+</script>
+
+</body>
+</html>
+"""
+    return Response(html, mimetype="text/html")
+
+
+if __name__ == "__main__":
+    # local dev
+    app.run(host="0.0.0.0", port=5000, debug=True)
