@@ -1,7 +1,8 @@
 from flask import Flask, jsonify, request, render_template_string
 import os
 import sqlite3
-from datetime import datetime, timezone
+import json
+from datetime import datetime, timezone, timedelta
 
 app = Flask(__name__)
 
@@ -11,19 +12,14 @@ app = Flask(__name__)
 API_KEY = os.environ.get("API_KEY", "dev-key-change-me")
 DB_PATH = "data.db"
 
-# LIVE if last update <= this many seconds
 LIVE_WINDOW_SECONDS = 15
 
-# Thresholds (edit anytime)
 CPU_WARN = 75
 CPU_CRIT = 90
-
 RAM_WARN = 75
 RAM_CRIT = 90
-
 DISK_WARN = 80
 DISK_CRIT = 90
-
 TEMP_WARN_C = 80
 TEMP_CRIT_C = 85
 
@@ -32,8 +28,14 @@ TEMP_CRIT_C = 85
 # DB HELPERS
 # ========================
 def db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
+
+    # reduce "database is locked"
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA temp_store=MEMORY;")
+    conn.execute("PRAGMA busy_timeout=5000;")
     return conn
 
 
@@ -58,7 +60,7 @@ def init_db():
         )
         """
     )
-    # Migrate / add new columns safely
+
     ensure_columns(
         conn,
         "stats",
@@ -68,8 +70,15 @@ def init_db():
             "disk_percent": "REAL",
             "disk_used_gb": "REAL",
             "disk_total_gb": "REAL",
+            # NEW
+            "drives_json": "TEXT",
+            "client_ts": "TEXT",
         },
     )
+
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_stats_pc_id ON stats(pc_name, id);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_stats_notes_id ON stats(notes, id);")
+
     conn.commit()
     conn.close()
 
@@ -122,8 +131,17 @@ def fmt2(x):
 
 
 def parse_ts_utc(ts_str):
-    # stored as "YYYY-MM-DD HH:MM:SS" UTC
     return datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+
+
+def safe_load_drives(drives_json):
+    if not drives_json:
+        return []
+    try:
+        d = json.loads(drives_json)
+        return d if isinstance(d, list) else []
+    except Exception:
+        return []
 
 
 # ========================
@@ -201,6 +219,21 @@ DASH_HTML = """
       font-size:12px;
     }
 
+    .btn{
+      border:1px solid rgba(255,255,255,.16);
+      background: rgba(255,255,255,.06);
+      color: rgba(255,255,255,.85);
+      padding:10px 12px;
+      border-radius:999px;
+      cursor:pointer;
+      font-weight:800;
+      letter-spacing:.3px;
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(10px);
+    }
+    .btn:active{transform:translateY(1px)}
+    .btn[data-on="false"]{opacity:.7}
+
     .grid{display:grid;grid-template-columns:repeat(12,1fr);gap:12px;margin-top:14px}
 
     .banner{
@@ -237,7 +270,7 @@ DASH_HTML = """
     .value{margin-top:6px;font-size:34px;font-weight:900;letter-spacing:.2px;text-shadow:0 0 22px var(--glow)}
     .sub{margin-top:6px;color:var(--muted);font-size:12px}
     .wide{grid-column:span 12}
-    .chartwrap{margin-top:10px;height:240px}
+    .chartwrap{margin-top:10px;height:260px}
 
     .chips{display:flex;flex-wrap:wrap;gap:10px;margin-top:10px}
     .chip{
@@ -249,6 +282,24 @@ DASH_HTML = """
       backdrop-filter: blur(10px);
       font-size:12px;color: rgba(255,255,255,.78);
     }
+
+    .progress{
+      height:10px;border-radius:999px;overflow:hidden;
+      background: rgba(255,255,255,.10);
+      border:1px solid rgba(255,255,255,.10);
+      margin-top:8px;
+    }
+    .bar{height:100%;width:0%}
+    .driveRow{
+      display:flex;align-items:center;justify-content:space-between;
+      gap:10px;margin-top:10px;padding:10px 12px;
+      border:1px solid rgba(255,255,255,.10);
+      background: rgba(255,255,255,.04);
+      border-radius:14px;
+    }
+    .driveLeft{display:flex;flex-direction:column;gap:4px;min-width:150px}
+    .driveName{font-weight:900;letter-spacing:.3px}
+    .driveMeta{color:rgba(255,255,255,.62);font-size:12px}
 
     .tablewrap{
       background: linear-gradient(180deg, var(--panel2), var(--panel));
@@ -274,7 +325,7 @@ DASH_HTML = """
       .card{grid-column:span 12}
       .title h1{font-size:24px}
       .value{font-size:30px}
-      .chartwrap{height:220px}
+      .chartwrap{height:240px}
       .rightbar{justify-content:flex-start}
     }
   </style>
@@ -297,12 +348,32 @@ DASH_HTML = """
           </select>
         </div>
 
+        <div class="selectwrap">
+          <select class="select" id="rangeSelect">
+            {% for r in range_options %}
+              <option value="{{r[0]}}" {% if r[0] == selected_range %}selected{% endif %}>{{r[1]}}</option>
+            {% endfor %}
+          </select>
+        </div>
+
+        <button class="btn" id="pauseBtn" data-on="true">⏸ Pause</button>
+
         <div class="badge" id="liveBadge">
           <span style="display:inline-flex;align-items:center;gap:8px;">
             <span class="dot" id="liveDot" style="background: {{status_color}}; box-shadow: 0 0 16px {{status_color}};"></span>
             <span style="font-weight:800; letter-spacing:.6px; color: rgba(255,255,255,.85);" id="liveText">{{status_text}}</span>
             <span style="opacity:.7;">• {{selected_pc}}</span>
           </span>
+        </div>
+
+        <div class="badge">
+          <span style="font-weight:900; color: rgba(255,255,255,.85);">UI FPS:</span>
+          <span id="fpsCounter" style="margin-left:6px;">—</span>
+        </div>
+
+        <div class="badge">
+          <span style="font-weight:900; color: rgba(255,255,255,.85);">Last update:</span>
+          <span id="ageCounter" style="margin-left:6px;">—</span>
         </div>
       </div>
     </div>
@@ -346,7 +417,7 @@ DASH_HTML = """
 
       <div class="card wide">
         <div class="label">Live Telemetry</div>
-        <div class="sub">CPU, RAM, DISK, TEMP (updates every 5 seconds)</div>
+        <div class="sub">CPU, RAM, DISK (worst drive %), TEMP — updates every 5 seconds</div>
         <div class="chartwrap">
           <canvas id="telemetryChart"></canvas>
         </div>
@@ -365,15 +436,38 @@ DASH_HTML = """
       </div>
 
       <div class="card">
-        <div class="label">DISK</div>
+        <div class="label">DISK (worst drive)</div>
         <div class="value" id="diskVal">{{disk_percent}}%</div>
-        <div class="sub" id="diskSub">{{disk_used_gb}} GB used • {{disk_total_gb}} GB total</div>
+        <div class="sub" id="diskSub">Total: {{disk_used_gb}} GB used • {{disk_total_gb}} GB total</div>
       </div>
 
       <div class="card">
         <div class="label">CPU TEMP</div>
         <div class="value" id="tempVal">{{cpu_temp}}°C</div>
         <div class="sub">May show — if not available</div>
+      </div>
+
+      <div class="card wide">
+        <div class="label">Drives</div>
+        <div class="sub">Per-drive usage (Windows multi-drive)</div>
+        <div id="drivesBox">
+          {% if drives and drives|length > 0 %}
+            {% for d in drives %}
+              <div class="driveRow">
+                <div class="driveLeft">
+                  <div class="driveName">{{d.mount}}</div>
+                  <div class="driveMeta">{{d.used_gb}} / {{d.total_gb}} GB • Free {{d.free_gb}} GB</div>
+                </div>
+                <div style="flex:1">
+                  <div class="progress"><div class="bar" data-p="{{d.percent}}"></div></div>
+                  <div class="driveMeta" style="margin-top:6px;">{{d.percent}}%</div>
+                </div>
+              </div>
+            {% endfor %}
+          {% else %}
+            <div class="sub">No drive data yet (update agent to multi-drive build).</div>
+          {% endif %}
+        </div>
       </div>
 
       <div class="card wide">
@@ -403,19 +497,36 @@ DASH_HTML = """
 
     </div>
 
-    <div class="footer">Tip: run agents on multiple PCs and switch using the dropdown.</div>
+    <div class="footer">Tip: run agents on multiple PCs and switch using the dropdown. Range + Pause controls are per-page.</div>
   </div>
 
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <script>
     const pcSelect = document.getElementById("pcSelect");
+    const rangeSelect = document.getElementById("rangeSelect");
+    const pauseBtn = document.getElementById("pauseBtn");
+    const fpsCounter = document.getElementById("fpsCounter");
+    const ageCounter = document.getElementById("ageCounter");
+
+    // drive bars
+    document.querySelectorAll(".bar").forEach(b=>{
+      const p = Math.max(0, Math.min(100, parseFloat(b.dataset.p || "0")));
+      b.style.width = p + "%";
+      // simple color logic without hardcoding a palette
+      if (p >= 90) b.style.background = "rgba(255,77,109,.9)";
+      else if (p >= 80) b.style.background = "rgba(255,176,32,.9)";
+      else b.style.background = "rgba(56,217,150,.9)";
+    });
 
     let chart;
+    let isPaused = false;
+    let lastServerTs = null;
+    let tickTimer = null;
 
-    function labelFromTs(ts) { return ts.slice(11); }
+    function labelFromTs(ts) { return ts ? ts.slice(11) : ""; }
 
-    async function fetchStats(pc) {
-      const res = await fetch(`/api/stats?pc=${encodeURIComponent(pc)}`, { cache: "no-store" });
+    async function fetchStats(pc, rangeKey) {
+      const res = await fetch(`/api/stats?pc=${encodeURIComponent(pc)}&range=${encodeURIComponent(rangeKey)}`, { cache: "no-store" });
       return await res.json();
     }
 
@@ -433,7 +544,7 @@ DASH_HTML = """
           datasets: [
             { label: "CPU %",  data: cpuData,  tension: 0.25, pointRadius: 0, borderWidth: 2 },
             { label: "RAM %",  data: ramData,  tension: 0.25, pointRadius: 0, borderWidth: 2 },
-            { label: "DISK %", data: diskData, tension: 0.25, pointRadius: 0, borderWidth: 2 },
+            { label: "DISK % (worst)", data: diskData, tension: 0.25, pointRadius: 0, borderWidth: 2 },
             { label: "TEMP °C", data: tempData, tension: 0.25, pointRadius: 0, borderWidth: 2 }
           ]
         },
@@ -443,16 +554,16 @@ DASH_HTML = """
           animation: false,
           plugins: { legend: { labels: { color: "rgba(255,255,255,0.75)" } } },
           scales: {
-            x: { ticks: { color: "rgba(255,255,255,0.55)", maxTicksLimit: 8 }, grid: { color: "rgba(255,255,255,0.08)" } },
+            x: { ticks: { color: "rgba(255,255,255,0.55)", maxTicksLimit: 10 }, grid: { color: "rgba(255,255,255,0.08)" } },
             y: { suggestedMin: 0, suggestedMax: 100, ticks: { color: "rgba(255,255,255,0.55)" }, grid: { color: "rgba(255,255,255,0.08)" } }
           }
         }
       });
     }
 
-    async function updateChart(pc) {
-      const rows = await fetchStats(pc);       // newest first
-      const data = rows.slice().reverse();     // oldest -> newest
+    async function updateChart(pc, rangeKey) {
+      const rows = await fetchStats(pc, rangeKey);  // newest first
+      const data = rows.slice().reverse();          // oldest -> newest
 
       const labels   = data.map(r => labelFromTs(r.ts));
       const cpuData  = data.map(r => (r.cpu ?? null));
@@ -484,24 +595,76 @@ DASH_HTML = """
       document.getElementById("cpuVal").textContent = (s.cpu_display ?? "—") + "%";
       document.getElementById("ramVal").textContent = (s.ram_display ?? "—") + "%";
       document.getElementById("diskVal").textContent = (s.disk_percent_display ?? "—") + "%";
-      document.getElementById("diskSub").textContent = `${s.disk_used_gb_display ?? "—"} GB used • ${s.disk_total_gb_display ?? "—"} GB total`;
+      document.getElementById("diskSub").textContent =
+        `Total: ${s.disk_used_gb_display ?? "—"} GB used • ${s.disk_total_gb_display ?? "—"} GB total`;
       document.getElementById("tempVal").textContent = (s.cpu_temp_display ?? "—") + "°C";
+
+      lastServerTs = s.latest_ts ?? null;
     }
 
-    function onPCChange() {
+    function makeURL(pc, rangeKey){
+      return `/?pc=${encodeURIComponent(pc)}&range=${encodeURIComponent(rangeKey)}`;
+    }
+
+    function onPCOrRangeChange() {
       const pc = pcSelect.value;
-      // Reload page so table + chips/banners match the selected PC
-      window.location = `/?pc=${encodeURIComponent(pc)}`;
+      const rangeKey = rangeSelect.value;
+      window.location = makeURL(pc, rangeKey);
     }
 
-    pcSelect.addEventListener("change", onPCChange);
+    pcSelect.addEventListener("change", onPCOrRangeChange);
+    rangeSelect.addEventListener("change", onPCOrRangeChange);
 
-    // Live updates for chart + top cards (selected PC)
+    pauseBtn.addEventListener("click", ()=>{
+      isPaused = !isPaused;
+      pauseBtn.textContent = isPaused ? "▶ Resume" : "⏸ Pause";
+      pauseBtn.dataset.on = isPaused ? "false" : "true";
+    });
+
+    // UI FPS counter
+    (function fpsLoop(){
+      let frames = 0;
+      let last = performance.now();
+
+      function raf(t){
+        frames++;
+        if (t - last >= 1000){
+          fpsCounter.textContent = String(frames);
+          frames = 0;
+          last = t;
+        }
+        requestAnimationFrame(raf);
+      }
+      requestAnimationFrame(raf);
+    })();
+
+    // "Last update: Xs ago" from server ts
+    function ageLoop(){
+      if (!lastServerTs){
+        ageCounter.textContent = "—";
+        return;
+      }
+      // lastServerTs is "YYYY-MM-DD HH:MM:SS" UTC
+      const iso = lastServerTs.replace(" ", "T") + "Z";
+      const dt = new Date(iso);
+      const ageSec = Math.max(0, Math.floor((Date.now() - dt.getTime()) / 1000));
+      ageCounter.textContent = ageSec + "s";
+    }
+    setInterval(ageLoop, 500);
+
     const selectedPC = pcSelect.value;
-    updateChart(selectedPC);
+    const selectedRange = rangeSelect.value;
+
+    async function tick(){
+      if (isPaused) return;
+      await updateChart(selectedPC, selectedRange);
+      await updateCards(selectedPC);
+    }
+
+    // initial
+    updateChart(selectedPC, selectedRange);
     updateCards(selectedPC);
-    setInterval(() => updateChart(selectedPC), 5000);
-    setInterval(() => updateCards(selectedPC), 5000);
+    tickTimer = setInterval(tick, 5000);
   </script>
 </body>
 </html>
@@ -514,10 +677,19 @@ DASH_HTML = """
 @app.get("/")
 def home():
     pc_param = request.args.get("pc", "").strip()
+    range_key = request.args.get("range", "1h").strip()
+
+    range_options = [
+        ("15m", "Last 15m"),
+        ("1h", "Last 1h"),
+        ("6h", "Last 6h"),
+        ("24h", "Last 24h"),
+    ]
+    valid_ranges = {k for k, _ in range_options}
+    selected_range = range_key if range_key in valid_ranges else "1h"
 
     conn = db()
 
-    # list PCs
     pcs = conn.execute(
         """
         SELECT DISTINCT COALESCE(pc_name, notes, 'unknown') AS pc
@@ -532,7 +704,7 @@ def home():
 
     rows = conn.execute(
         """
-        SELECT ts,cpu,ram,cpu_temp,disk_percent,disk_used_gb,disk_total_gb,notes
+        SELECT ts,cpu,ram,cpu_temp,disk_percent,disk_used_gb,disk_total_gb,notes,drives_json
         FROM stats
         WHERE COALESCE(pc_name, notes, 'unknown') = ?
         ORDER BY id DESC
@@ -555,7 +727,6 @@ def home():
     banner_title = ""
     banner_subtitle = ""
 
-    # Display values
     cpu_v = "—"
     ram_v = "—"
     disk_p = "—"
@@ -563,10 +734,12 @@ def home():
     disk_total = "—"
     temp_v = "—"
     ts_v = "—"
+    drives = []
 
     if rows:
         latest = rows[0]
         ts_v = latest["ts"]
+        drives = safe_load_drives(latest["drives_json"])
 
         # Live/offline
         try:
@@ -579,13 +752,11 @@ def home():
         status_text = "LIVE" if is_live else "OFFLINE"
         status_color = "#38d996" if is_live else "#ff4d6d"
 
-        # Health chips
         cpu_health, cpu_health_color = health_from_percent(latest["cpu"], CPU_WARN, CPU_CRIT)
         ram_health, ram_health_color = health_from_percent(latest["ram"], RAM_WARN, RAM_CRIT)
         disk_health, disk_health_color = health_from_percent(latest["disk_percent"], DISK_WARN, DISK_CRIT)
         temp_health, temp_health_color = health_from_temp_c(latest["cpu_temp"], TEMP_WARN_C, TEMP_CRIT_C)
 
-        # Banner if anything critical
         crits = []
         if cpu_health == "CRIT":
             crits.append("CPU")
@@ -601,7 +772,6 @@ def home():
             banner_title = "CRITICAL"
             banner_subtitle = " • ".join(crits) + " above critical threshold"
 
-        # Format display
         cpu_v = fmt1(latest["cpu"])
         ram_v = fmt1(latest["ram"])
         disk_p = fmt1(latest["disk_percent"])
@@ -614,6 +784,10 @@ def home():
         pc_list=pc_list,
         selected_pc=selected_pc,
         rows=rows,
+        drives=drives,
+
+        range_options=range_options,
+        selected_range=selected_range,
 
         status_text=status_text,
         status_color=status_color,
@@ -656,18 +830,27 @@ def ingest():
     disk_used_gb = data.get("disk_used_gb")
     disk_total_gb = data.get("disk_total_gb")
 
-    pc_name = data.get("pc_name") or data.get("notes")  # allow older agents
+    drives = data.get("drives")  # NEW list
+    drives_json = None
+    try:
+        if isinstance(drives, list):
+            drives_json = json.dumps(drives)
+    except Exception:
+        drives_json = None
+
+    pc_name = data.get("pc_name") or data.get("notes")
     notes = data.get("notes") or pc_name
 
+    client_ts = data.get("client_ts")
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
     conn = db()
     conn.execute(
         """
-        INSERT INTO stats (ts,cpu,ram,cpu_temp,notes,pc_name,disk_percent,disk_used_gb,disk_total_gb)
-        VALUES (?,?,?,?,?,?,?,?,?)
+        INSERT INTO stats (ts,cpu,ram,cpu_temp,notes,pc_name,disk_percent,disk_used_gb,disk_total_gb,drives_json,client_ts)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)
         """,
-        (ts, cpu, ram, cpu_temp, notes, pc_name, disk_percent, disk_used_gb, disk_total_gb),
+        (ts, cpu, ram, cpu_temp, notes, pc_name, disk_percent, disk_used_gb, disk_total_gb, drives_json, client_ts),
     )
     conn.commit()
     conn.close()
@@ -678,8 +861,22 @@ def ingest():
 @app.get("/api/stats")
 def api_stats():
     pc = request.args.get("pc", "").strip()
+    range_key = request.args.get("range", "1h").strip()
     if not pc:
         return jsonify([])
+
+    # range -> cutoff timestamp
+    now = datetime.now(timezone.utc)
+    if range_key == "15m":
+        cutoff = now - timedelta(minutes=15)
+    elif range_key == "6h":
+        cutoff = now - timedelta(hours=6)
+    elif range_key == "24h":
+        cutoff = now - timedelta(hours=24)
+    else:
+        cutoff = now - timedelta(hours=1)
+
+    cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
 
     conn = db()
     rows = conn.execute(
@@ -687,10 +884,11 @@ def api_stats():
         SELECT ts,cpu,ram,cpu_temp,disk_percent,disk_used_gb,disk_total_gb,notes
         FROM stats
         WHERE COALESCE(pc_name, notes, 'unknown') = ?
+          AND ts >= ?
         ORDER BY id DESC
-        LIMIT 200
+        LIMIT 600
         """,
-        (pc,),
+        (pc, cutoff_str),
     ).fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
@@ -705,7 +903,7 @@ def api_summary():
     conn = db()
     latest = conn.execute(
         """
-        SELECT ts,cpu,ram,cpu_temp,disk_percent,disk_used_gb,disk_total_gb
+        SELECT ts,cpu,ram,cpu_temp,disk_percent,disk_used_gb,disk_total_gb,drives_json
         FROM stats
         WHERE COALESCE(pc_name, notes, 'unknown') = ?
         ORDER BY id DESC
@@ -726,10 +924,10 @@ def api_summary():
                 "disk_used_gb_display": "—",
                 "disk_total_gb_display": "—",
                 "cpu_temp_display": "—",
+                "latest_ts": None,
             }
         )
 
-    # live/offline
     try:
         age_seconds = (datetime.now(timezone.utc) - parse_ts_utc(latest["ts"])).total_seconds()
         is_live = age_seconds <= LIVE_WINDOW_SECONDS
@@ -749,6 +947,7 @@ def api_summary():
             "disk_used_gb_display": fmt2(latest["disk_used_gb"]),
             "disk_total_gb_display": fmt2(latest["disk_total_gb"]),
             "cpu_temp_display": fmt1(latest["cpu_temp"]),
+            "latest_ts": latest["ts"],
         }
     )
 
