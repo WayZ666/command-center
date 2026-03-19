@@ -10,7 +10,7 @@ app = Flask(__name__)
 # ========================
 # CONFIG
 # ========================
-API_KEY = os.environ.get("API_KEY")
+API_KEY = os.environ.get("K9fT2xQ7mZ4pL8sV1rW6bH3yN5uD0cAq")
 if not API_KEY:
     raise RuntimeError("API_KEY environment variable is required")
 
