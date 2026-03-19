@@ -1,18 +1,22 @@
 from flask import Flask, jsonify, request, render_template_string
+import json
 import os
 import sqlite3
-import json
 from datetime import datetime, timezone, timedelta
+from typing import Any, Optional
 
 app = Flask(__name__)
 
 # ========================
 # CONFIG
 # ========================
-API_KEY = os.environ.get("API_KEY", "dev-key-change-me")
-DB_PATH = "data.db"
+API_KEY = os.environ.get("API_KEY")
+if not API_KEY:
+    raise RuntimeError("API_KEY environment variable is required")
 
-LIVE_WINDOW_SECONDS = 15
+DB_PATH = os.environ.get("COMMAND_CENTER_DB_PATH", "data.db")
+LIVE_WINDOW_SECONDS = int(os.environ.get("LIVE_WINDOW_SECONDS", "15"))
+MAX_STATS_POINTS = int(os.environ.get("MAX_STATS_POINTS", "1000"))
 
 CPU_WARN = 75
 CPU_CRIT = 90
@@ -27,11 +31,9 @@ TEMP_CRIT_C = 85
 # ========================
 # DB HELPERS
 # ========================
-def db():
+def db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
-
-    # reduce "database is locked"
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA temp_store=MEMORY;")
@@ -39,14 +41,14 @@ def db():
     return conn
 
 
-def ensure_columns(conn, table: str, needed_cols: dict):
+def ensure_columns(conn: sqlite3.Connection, table: str, needed_cols: dict[str, str]) -> None:
     existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
     for col, sql_type in needed_cols.items():
         if col not in existing:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {sql_type}")
 
 
-def init_db():
+def init_db() -> None:
     conn = db()
     conn.execute(
         """
@@ -70,7 +72,6 @@ def init_db():
             "disk_percent": "REAL",
             "disk_used_gb": "REAL",
             "disk_total_gb": "REAL",
-            # NEW
             "drives_json": "TEXT",
             "client_ts": "TEXT",
         },
@@ -78,7 +79,7 @@ def init_db():
 
     conn.execute("CREATE INDEX IF NOT EXISTS idx_stats_pc_id ON stats(pc_name, id);")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_stats_notes_id ON stats(notes, id);")
-
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_stats_ts_id ON stats(ts, id);")
     conn.commit()
     conn.close()
 
@@ -87,65 +88,147 @@ init_db()
 
 
 # ========================
-# HEALTH HELPERS
+# HELPERS
 # ========================
-def _to_float(x):
+def utc_now_str() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _to_float(value: Any) -> Optional[float]:
     try:
-        if x is None:
+        if value is None or value == "":
             return None
-        return float(x)
+        return float(value)
     except Exception:
         return None
 
 
-def health_from_percent(p, warn, crit):
-    p = _to_float(p)
-    if p is None:
-        return ("—", "#9aa4b2")
-    if p >= crit:
-        return ("CRIT", "#ff4d6d")
-    if p >= warn:
-        return ("WARN", "#ffb020")
-    return ("OK", "#38d996")
+def clamp_num(value: Any, low: float, high: float) -> Optional[float]:
+    v = _to_float(value)
+    if v is None:
+        return None
+    return max(low, min(high, v))
 
 
-def health_from_temp_c(t, warn, crit):
-    t = _to_float(t)
-    if t is None:
-        return ("—", "#9aa4b2")
-    if t >= crit:
-        return ("CRIT", "#ff4d6d")
-    if t >= warn:
-        return ("WARN", "#ffb020")
-    return ("OK", "#38d996")
+def clean_text(value: Any, max_len: int = 200) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if len(text) > max_len:
+        text = text[:max_len]
+    return text
 
 
-def fmt1(x):
-    x = _to_float(x)
-    return "—" if x is None else f"{x:.1f}"
+def validate_ts(ts_value: Any) -> Optional[str]:
+    if ts_value is None:
+        return None
+    ts_str = str(ts_value).strip()
+    try:
+        dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
 
 
-def fmt2(x):
-    x = _to_float(x)
-    return "—" if x is None else f"{x:.2f}"
+def normalize_drives(drives: Any) -> list[dict[str, Any]]:
+    if not isinstance(drives, list):
+        return []
+
+    cleaned: list[dict[str, Any]] = []
+    for item in drives[:32]:
+        if not isinstance(item, dict):
+            continue
+
+        mount = clean_text(item.get("mount"), max_len=32)
+        percent = clamp_num(item.get("percent"), 0, 100)
+        used_gb = _to_float(item.get("used_gb"))
+        total_gb = _to_float(item.get("total_gb"))
+        free_gb = _to_float(item.get("free_gb"))
+
+        cleaned.append(
+            {
+                "mount": mount or "?",
+                "percent": percent,
+                "used_gb": round(used_gb, 2) if used_gb is not None else None,
+                "total_gb": round(total_gb, 2) if total_gb is not None else None,
+                "free_gb": round(free_gb, 2) if free_gb is not None else None,
+            }
+        )
+    return cleaned
 
 
-def parse_ts_utc(ts_str):
+def parse_ts_utc(ts_str: str) -> datetime:
     return datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
 
 
-def safe_load_drives(drives_json):
+def safe_load_drives(drives_json: Optional[str]) -> list[dict[str, Any]]:
     if not drives_json:
         return []
     try:
-        d = json.loads(drives_json)
-        return d if isinstance(d, list) else []
+        data = json.loads(drives_json)
+        return data if isinstance(data, list) else []
     except Exception:
         return []
 
 
+def fmt1(x: Any) -> str:
+    v = _to_float(x)
+    return "—" if v is None else f"{v:.1f}"
+
+
+def fmt2(x: Any) -> str:
+    v = _to_float(x)
+    return "—" if v is None else f"{v:.2f}"
+
+
+def health_from_percent(p: Any, warn: float, crit: float) -> tuple[str, str]:
+    v = _to_float(p)
+    if v is None:
+        return ("—", "#9aa4b2")
+    if v >= crit:
+        return ("CRIT", "#ff4d6d")
+    if v >= warn:
+        return ("WARN", "#ffb020")
+    return ("OK", "#38d996")
+
+
+def health_from_temp_c(t: Any, warn: float, crit: float) -> tuple[str, str]:
+    v = _to_float(t)
+    if v is None:
+        return ("—", "#9aa4b2")
+    if v >= crit:
+        return ("CRIT", "#ff4d6d")
+    if v >= warn:
+        return ("WARN", "#ffb020")
+    return ("OK", "#38d996")
+
+
+def get_range_delta(range_key: str) -> timedelta:
+    mapping = {
+        "15m": timedelta(minutes=15),
+        "1h": timedelta(hours=1),
+        "6h": timedelta(hours=6),
+        "24h": timedelta(hours=24),
+    }
+    return mapping.get(range_key, timedelta(hours=1))
+
+
+def get_selected_pc(conn: sqlite3.Connection, requested_pc: str) -> tuple[list[str], str]:
+    pcs = conn.execute(
+        """
+        SELECT DISTINCT COALESCE(NULLIF(pc_name, ''), NULLIF(notes, ''), 'unknown') AS pc
+        FROM stats
+        ORDER BY pc ASC
+        """
+    ).fetchall()
+
+    pc_list = [r["pc"] for r in pcs] if pcs else ["unknown"]
+    selected_pc = requested_pc if requested_pc and requested_pc in pc_list else pc_list[0]
+    return pc_list, selected_pc
+
+
 # ========================
-# UI
+# HTML
 # ========================
 DASH_HTML = """
 <!doctype html>
@@ -162,165 +245,100 @@ DASH_HTML = """
       --text:rgba(255,255,255,.92);
       --muted:rgba(255,255,255,.62);
       --glow:rgba(80,160,255,.35);
-      --shadow: 0 16px 50px rgba(0,0,0,.55);
+      --shadow:0 16px 50px rgba(0,0,0,.55);
       --radius:18px;
     }
     *{box-sizing:border-box}
     body{
       margin:0;
-      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
+      font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial;
       background:
         radial-gradient(900px 500px at 15% -10%, rgba(80,160,255,.22), transparent 60%),
-        radial-gradient(700px 420px at 85% 10%, rgba(160,80,255,.18), transparent 55%),
-        radial-gradient(900px 600px at 50% 120%, rgba(0,255,190,.10), transparent 55%),
-        var(--bg);
+        radial-gradient(900px 600px at 110% 10%, rgba(56,217,150,.08), transparent 55%),
+        linear-gradient(180deg, #070A12 0%, #0B1020 100%);
       color:var(--text);
       min-height:100vh;
-      padding:22px;
     }
-    .wrap{max-width:1020px;margin:0 auto}
-    .topbar{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:14px}
-    .title{line-height:1.05}
-    .title h1{margin:0;font-size:28px;letter-spacing:.4px;font-weight:800}
-    .title p{margin:8px 0 0 0;color:var(--muted);font-size:14px}
-
-    .rightbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;justify-content:flex-end}
-    .badge{
-      background: linear-gradient(180deg, rgba(255,255,255,.10), rgba(255,255,255,.05));
-      border: 1px solid var(--border);
-      padding:10px 12px;border-radius:999px;box-shadow:var(--shadow);
-      backdrop-filter: blur(10px);
-      font-size:12px;color:var(--muted);white-space:nowrap
+    .wrap{max-width:1320px;margin:0 auto;padding:22px}
+    .topbar{
+      display:flex;gap:14px;justify-content:space-between;align-items:center;flex-wrap:wrap;
+      margin-bottom:18px
     }
-    .dot{width:10px;height:10px;border-radius:999px;display:inline-block}
-
-    .select{
-      appearance:none;
-      background: rgba(255,255,255,.06);
-      border: 1px solid rgba(255,255,255,.16);
-      color: rgba(255,255,255,.85);
-      padding:10px 36px 10px 12px;
-      border-radius:999px;
-      box-shadow: var(--shadow);
-      backdrop-filter: blur(10px);
-      font-weight:700;
-      letter-spacing:.3px;
-      cursor:pointer;
-    }
-    .selectwrap{position:relative}
-    .selectwrap:after{
-      content:"▾";
-      position:absolute;
-      right:12px;
-      top:50%;
-      transform:translateY(-50%);
-      color: rgba(255,255,255,.55);
-      pointer-events:none;
-      font-size:12px;
-    }
-
-    .btn{
-      border:1px solid rgba(255,255,255,.16);
-      background: rgba(255,255,255,.06);
-      color: rgba(255,255,255,.85);
-      padding:10px 12px;
-      border-radius:999px;
-      cursor:pointer;
-      font-weight:800;
-      letter-spacing:.3px;
-      box-shadow: var(--shadow);
-      backdrop-filter: blur(10px);
-    }
-    .btn:active{transform:translateY(1px)}
-    .btn[data-on="false"]{opacity:.7}
-
-    .grid{display:grid;grid-template-columns:repeat(12,1fr);gap:12px;margin-top:14px}
-
-    .banner{
-      grid-column:span 12;
-      border-radius: var(--radius);
-      border: 1px solid rgba(255,255,255,.14);
-      background: linear-gradient(180deg, rgba(255,77,109,.18), rgba(255,77,109,.08));
-      box-shadow: var(--shadow);
-      backdrop-filter: blur(10px);
-      padding:12px 14px;
-      display:flex;align-items:center;justify-content:space-between;gap:10px;
-    }
-    .banner b{letter-spacing:.5px}
-    .banner small{color: rgba(255,255,255,.7)}
-
-    .card{
-      grid-column:span 6;
-      background: linear-gradient(180deg, var(--panel2), var(--panel));
+    .title h1{margin:0;font-size:32px;letter-spacing:.2px}
+    .title p{margin:6px 0 0;color:var(--muted)}
+    .rightbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+    .badge,.select,.btn{
       border:1px solid var(--border);
-      border-radius:var(--radius);
-      padding:14px;
-      box-shadow:var(--shadow);
-      backdrop-filter: blur(10px);
-      position:relative;
-      overflow:hidden;
-    }
-    .card:before{
-      content:"";
-      position:absolute;inset:-2px;
-      background: radial-gradient(420px 120px at 10% 0%, rgba(80,160,255,.18), transparent 60%);
-      pointer-events:none;
-    }
-    .label{color:var(--muted);font-size:12px;letter-spacing:.6px;text-transform:uppercase}
-    .value{margin-top:6px;font-size:34px;font-weight:900;letter-spacing:.2px;text-shadow:0 0 22px var(--glow)}
-    .sub{margin-top:6px;color:var(--muted);font-size:12px}
-    .wide{grid-column:span 12}
-    .chartwrap{margin-top:10px;height:260px}
-
-    .chips{display:flex;flex-wrap:wrap;gap:10px;margin-top:10px}
-    .chip{
-      display:inline-flex;align-items:center;gap:8px;
-      padding:10px 12px;border-radius:999px;
-      border:1px solid rgba(255,255,255,.14);
-      background: rgba(255,255,255,.06);
-      box-shadow: 0 10px 30px rgba(0,0,0,.35);
-      backdrop-filter: blur(10px);
-      font-size:12px;color: rgba(255,255,255,.78);
-    }
-
-    .progress{
-      height:10px;border-radius:999px;overflow:hidden;
-      background: rgba(255,255,255,.10);
-      border:1px solid rgba(255,255,255,.10);
-      margin-top:8px;
-    }
-    .bar{height:100%;width:0%}
-    .driveRow{
-      display:flex;align-items:center;justify-content:space-between;
-      gap:10px;margin-top:10px;padding:10px 12px;
-      border:1px solid rgba(255,255,255,.10);
-      background: rgba(255,255,255,.04);
+      background:var(--panel);
+      color:var(--text);
       border-radius:14px;
+      box-shadow:var(--shadow);
     }
-    .driveLeft{display:flex;flex-direction:column;gap:4px;min-width:150px}
-    .driveName{font-weight:900;letter-spacing:.3px}
-    .driveMeta{color:rgba(255,255,255,.62);font-size:12px}
-
-    .tablewrap{
-      background: linear-gradient(180deg, var(--panel2), var(--panel));
+    .badge{padding:10px 14px}
+    .select,.btn{padding:10px 12px}
+    .btn{cursor:pointer}
+    .btn:hover{background:var(--panel2)}
+    .selectwrap{position:relative}
+    .select{appearance:none;outline:none}
+    .grid{
+      display:grid;
+      grid-template-columns:repeat(12,1fr);
+      gap:14px;
+    }
+    .card{
+      grid-column:span 3;
+      background:linear-gradient(180deg,var(--panel2),var(--panel));
       border:1px solid var(--border);
       border-radius:var(--radius);
       box-shadow:var(--shadow);
-      backdrop-filter: blur(10px);
-      overflow:hidden;
+      padding:16px;
+      min-height:132px;
     }
-    table{width:100%;border-collapse:collapse}
-    th,td{padding:12px 14px;font-size:13px;border-bottom:1px solid rgba(255,255,255,.08);text-align:left}
+    .wide{grid-column:span 8}
+    .tall{grid-column:span 4}
+    .chartwrap{height:340px}
+    .label{font-size:12px;letter-spacing:.8px;text-transform:uppercase;color:var(--muted)}
+    .value{font-size:38px;font-weight:900;margin-top:8px}
+    .sub{margin-top:10px;color:var(--muted);font-size:14px}
+    .health{margin-top:10px;font-weight:800}
+    .dot{
+      width:10px;height:10px;border-radius:999px;display:inline-block;vertical-align:middle
+    }
+    table{width:100%;border-collapse:collapse;margin-top:10px}
+    th,td{
+      padding:10px 8px;
+      border-bottom:1px solid rgba(255,255,255,.08);
+      text-align:left
+    }
     th{
-      color: rgba(255,255,255,.70);
+      color:rgba(255,255,255,.70);
       letter-spacing:.6px;
       text-transform:uppercase;
       font-size:12px;
-      background: rgba(255,255,255,.04);
+      background:rgba(255,255,255,.04);
     }
-    tr:hover td{background: rgba(255,255,255,.03)}
-    .footer{margin-top:14px;color: rgba(255,255,255,.45);font-size:12px}
-
+    tr:hover td{background:rgba(255,255,255,.03)}
+    .footer{margin-top:14px;color:rgba(255,255,255,.45);font-size:12px}
+    .drives{display:flex;flex-direction:column;gap:10px;margin-top:8px}
+    .drive{
+      padding:10px 12px;border:1px solid rgba(255,255,255,.08);
+      border-radius:12px;background:rgba(255,255,255,.03)
+    }
+    .drive-head{
+      display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:8px
+    }
+    .meter{
+      width:100%;height:10px;border-radius:999px;background:rgba(255,255,255,.08);overflow:hidden
+    }
+    .bar{
+      height:100%;width:0%;
+      background:rgba(56,217,150,.9);
+      transition:width .25s ease;
+    }
+    @media (max-width: 1100px){
+      .card{grid-column:span 6}
+      .wide,.tall{grid-column:span 12}
+    }
     @media (max-width: 720px){
       .card{grid-column:span 12}
       .title h1{font-size:24px}
@@ -330,7 +348,6 @@ DASH_HTML = """
     }
   </style>
 </head>
-
 <body>
   <div class="wrap">
     <div class="topbar">
@@ -343,7 +360,7 @@ DASH_HTML = """
         <div class="selectwrap">
           <select class="select" id="pcSelect">
             {% for pc in pc_list %}
-              <option value="{{pc}}" {% if pc == selected_pc %}selected{% endif %}>{{pc}}</option>
+              <option value="{{ pc }}" {% if pc == selected_pc %}selected{% endif %}>{{ pc }}</option>
             {% endfor %}
           </select>
         </div>
@@ -351,18 +368,18 @@ DASH_HTML = """
         <div class="selectwrap">
           <select class="select" id="rangeSelect">
             {% for r in range_options %}
-              <option value="{{r[0]}}" {% if r[0] == selected_range %}selected{% endif %}>{{r[1]}}</option>
+              <option value="{{ r[0] }}" {% if r[0] == selected_range %}selected{% endif %}>{{ r[1] }}</option>
             {% endfor %}
           </select>
         </div>
 
-        <button class="btn" id="pauseBtn" data-on="true">⏸ Pause</button>
+        <button class="btn" id="pauseBtn">⏸ Pause</button>
 
-        <div class="badge" id="liveBadge">
+        <div class="badge">
           <span style="display:inline-flex;align-items:center;gap:8px;">
-            <span class="dot" id="liveDot" style="background: {{status_color}}; box-shadow: 0 0 16px {{status_color}};"></span>
-            <span style="font-weight:800; letter-spacing:.6px; color: rgba(255,255,255,.85);" id="liveText">{{status_text}}</span>
-            <span style="opacity:.7;">• {{selected_pc}}</span>
+            <span class="dot" id="liveDot" style="background: {{ status_color }}; box-shadow: 0 0 16px {{ status_color }};"></span>
+            <span style="font-weight:800; letter-spacing:.6px; color: rgba(255,255,255,.85);" id="liveText">{{ status_text }}</span>
+            <span style="opacity:.7;">• {{ selected_pc }}</span>
           </span>
         </div>
 
@@ -378,123 +395,91 @@ DASH_HTML = """
       </div>
     </div>
 
-    {% if banner_show %}
     <div class="grid">
-      <div class="banner">
-        <div>
-          <b>⚠ {{banner_title}}</b>
-          <small>• {{banner_subtitle}}</small>
-        </div>
-        <small>Threshold alerts enabled</small>
+      <div class="card">
+        <div class="label">CPU</div>
+        <div class="value" id="cpuValue">{{ cpu_value }}</div>
+        <div class="sub">Current load</div>
+        <div class="health" id="cpuHealth" style="color: {{ cpu_health_color }};">{{ cpu_health }}</div>
       </div>
-    </div>
-    {% endif %}
 
-    <div class="grid">
+      <div class="card">
+        <div class="label">RAM</div>
+        <div class="value" id="ramValue">{{ ram_value }}</div>
+        <div class="sub">Memory usage</div>
+        <div class="health" id="ramHealth" style="color: {{ ram_health_color }};">{{ ram_health }}</div>
+      </div>
 
-      <div class="card wide">
-        <div class="label">System Health</div>
-        <div class="sub">OK / WARN / CRIT • thresholds</div>
-        <div class="chips">
-          <div class="chip">
-            <span class="dot" style="background: {{cpu_health_color}}; box-shadow: 0 0 14px {{cpu_health_color}};"></span>
-            <span>CPU: <b>{{cpu_health}}</b></span>
-          </div>
-          <div class="chip">
-            <span class="dot" style="background: {{ram_health_color}}; box-shadow: 0 0 14px {{ram_health_color}};"></span>
-            <span>RAM: <b>{{ram_health}}</b></span>
-          </div>
-          <div class="chip">
-            <span class="dot" style="background: {{disk_health_color}}; box-shadow: 0 0 14px {{disk_health_color}};"></span>
-            <span>DISK: <b>{{disk_health}}</b></span>
-          </div>
-          <div class="chip">
-            <span class="dot" style="background: {{temp_health_color}}; box-shadow: 0 0 14px {{temp_health_color}};"></span>
-            <span>TEMP: <b>{{temp_health}}</b></span>
-          </div>
-        </div>
+      <div class="card">
+        <div class="label">Disk</div>
+        <div class="value" id="diskValue">{{ disk_value }}</div>
+        <div class="sub">Worst drive usage</div>
+        <div class="health" id="diskHealth" style="color: {{ disk_health_color }};">{{ disk_health }}</div>
+      </div>
+
+      <div class="card">
+        <div class="label">CPU Temp</div>
+        <div class="value" id="tempValue">{{ temp_value }}</div>
+        <div class="sub">Sensor reading</div>
+        <div class="health" id="tempHealth" style="color: {{ temp_health_color }};">{{ temp_health }}</div>
       </div>
 
       <div class="card wide">
-        <div class="label">Live Telemetry</div>
-        <div class="sub">CPU, RAM, DISK (worst drive %), TEMP — updates every 5 seconds</div>
+        <div class="label">Telemetry History</div>
         <div class="chartwrap">
           <canvas id="telemetryChart"></canvas>
         </div>
       </div>
 
-      <div class="card">
-        <div class="label">CPU</div>
-        <div class="value" id="cpuVal">{{cpu}}%</div>
-        <div class="sub">Processor load</div>
-      </div>
-
-      <div class="card">
-        <div class="label">RAM</div>
-        <div class="value" id="ramVal">{{ram}}%</div>
-        <div class="sub">Memory usage</div>
-      </div>
-
-      <div class="card">
-        <div class="label">DISK (worst drive)</div>
-        <div class="value" id="diskVal">{{disk_percent}}%</div>
-        <div class="sub" id="diskSub">Total: {{disk_used_gb}} GB used • {{disk_total_gb}} GB total</div>
-      </div>
-
-      <div class="card">
-        <div class="label">CPU TEMP</div>
-        <div class="value" id="tempVal">{{cpu_temp}}°C</div>
-        <div class="sub">May show — if not available</div>
-      </div>
-
-      <div class="card wide">
-        <div class="label">Drives</div>
-        <div class="sub">Per-drive usage (Windows multi-drive)</div>
-        <div id="drivesBox">
-          {% if drives and drives|length > 0 %}
+      <div class="card tall">
+        <div class="label">Drive Details</div>
+        <div class="drives" id="drivesWrap">
+          {% if drives %}
             {% for d in drives %}
-              <div class="driveRow">
-                <div class="driveLeft">
-                  <div class="driveName">{{d.mount}}</div>
-                  <div class="driveMeta">{{d.used_gb}} / {{d.total_gb}} GB • Free {{d.free_gb}} GB</div>
+              <div class="drive">
+                <div class="drive-head">
+                  <strong>{{ d.mount }}</strong>
+                  <span>{{ "%.1f"|format(d.percent or 0) }}%</span>
                 </div>
-                <div style="flex:1">
-                  <div class="progress"><div class="bar" data-p="{{d.percent}}"></div></div>
-                  <div class="driveMeta" style="margin-top:6px;">{{d.percent}}%</div>
-                </div>
+                <div class="meter"><div class="bar" data-p="{{ d.percent or 0 }}"></div></div>
+                <div class="sub">{{ d.used_gb }} / {{ d.total_gb }} GB</div>
               </div>
             {% endfor %}
           {% else %}
-            <div class="sub">No drive data yet (update agent to multi-drive build).</div>
+            <div class="sub">No drive data yet.</div>
           {% endif %}
         </div>
       </div>
 
-      <div class="card wide">
-        <div class="tablewrap">
+      <div class="card" style="grid-column: span 12;">
+        <div class="label">Recent Readings</div>
+        <div style="overflow:auto;">
           <table>
-            <tr>
-              <th>Time (UTC)</th>
-              <th>CPU</th>
-              <th>RAM</th>
-              <th>DISK%</th>
-              <th>TEMP°C</th>
-              <th>Notes</th>
-            </tr>
-            {% for r in rows %}
-            <tr>
-              <td>{{r["ts"]}}</td>
-              <td>{{r["cpu"]}}</td>
-              <td>{{r["ram"]}}</td>
-              <td>{{r["disk_percent"]}}</td>
-              <td>{{r["cpu_temp"]}}</td>
-              <td>{{r["notes"] or ""}}</td>
-            </tr>
-            {% endfor %}
+            <thead>
+              <tr>
+                <th>Server Time</th>
+                <th>Client Time</th>
+                <th>CPU</th>
+                <th>RAM</th>
+                <th>Disk</th>
+                <th>Temp</th>
+              </tr>
+            </thead>
+            <tbody id="recentTable">
+              {% for row in recent_rows %}
+              <tr>
+                <td>{{ row["ts"] }}</td>
+                <td>{{ row["client_ts"] or "—" }}</td>
+                <td>{{ "%.1f"|format(row["cpu"] or 0) if row["cpu"] is not none else "—" }}%</td>
+                <td>{{ "%.1f"|format(row["ram"] or 0) if row["ram"] is not none else "—" }}%</td>
+                <td>{{ "%.1f"|format(row["disk_percent"] or 0) if row["disk_percent"] is not none else "—" }}%</td>
+                <td>{{ "%.1f"|format(row["cpu_temp"] or 0) if row["cpu_temp"] is not none else "—" }}°C</td>
+              </tr>
+              {% endfor %}
+            </tbody>
           </table>
         </div>
       </div>
-
     </div>
 
     <div class="footer">Tip: run agents on multiple PCs and switch using the dropdown. Range + Pause controls are per-page.</div>
@@ -508,30 +493,50 @@ DASH_HTML = """
     const fpsCounter = document.getElementById("fpsCounter");
     const ageCounter = document.getElementById("ageCounter");
 
-    // drive bars
-    document.querySelectorAll(".bar").forEach(b=>{
-      const p = Math.max(0, Math.min(100, parseFloat(b.dataset.p || "0")));
-      b.style.width = p + "%";
-      // simple color logic without hardcoding a palette
-      if (p >= 90) b.style.background = "rgba(255,77,109,.9)";
-      else if (p >= 80) b.style.background = "rgba(255,176,32,.9)";
-      else b.style.background = "rgba(56,217,150,.9)";
-    });
+    const cpuValue = document.getElementById("cpuValue");
+    const ramValue = document.getElementById("ramValue");
+    const diskValue = document.getElementById("diskValue");
+    const tempValue = document.getElementById("tempValue");
+
+    const cpuHealth = document.getElementById("cpuHealth");
+    const ramHealth = document.getElementById("ramHealth");
+    const diskHealth = document.getElementById("diskHealth");
+    const tempHealth = document.getElementById("tempHealth");
+
+    const liveDot = document.getElementById("liveDot");
+    const liveText = document.getElementById("liveText");
+    const drivesWrap = document.getElementById("drivesWrap");
+    const recentTable = document.getElementById("recentTable");
 
     let chart;
     let isPaused = false;
     let lastServerTs = null;
     let tickTimer = null;
+    let ticking = false;
 
-    function labelFromTs(ts) { return ts ? ts.slice(11) : ""; }
+    function labelFromTs(ts) {
+      return ts ? ts.slice(11) : "";
+    }
+
+    function applyBars() {
+      document.querySelectorAll(".bar").forEach(b => {
+        const p = Math.max(0, Math.min(100, parseFloat(b.dataset.p || "0")));
+        b.style.width = p + "%";
+        if (p >= 90) b.style.background = "rgba(255,77,109,.9)";
+        else if (p >= 80) b.style.background = "rgba(255,176,32,.9)";
+        else b.style.background = "rgba(56,217,150,.9)";
+      });
+    }
 
     async function fetchStats(pc, rangeKey) {
       const res = await fetch(`/api/stats?pc=${encodeURIComponent(pc)}&range=${encodeURIComponent(rangeKey)}`, { cache: "no-store" });
+      if (!res.ok) throw new Error(`stats ${res.status}`);
       return await res.json();
     }
 
     async function fetchSummary(pc) {
       const res = await fetch(`/api/summary?pc=${encodeURIComponent(pc)}`, { cache: "no-store" });
+      if (!res.ok) throw new Error(`summary ${res.status}`);
       return await res.json();
     }
 
@@ -542,8 +547,8 @@ DASH_HTML = """
         data: {
           labels,
           datasets: [
-            { label: "CPU %",  data: cpuData,  tension: 0.25, pointRadius: 0, borderWidth: 2 },
-            { label: "RAM %",  data: ramData,  tension: 0.25, pointRadius: 0, borderWidth: 2 },
+            { label: "CPU %", data: cpuData, tension: 0.25, pointRadius: 0, borderWidth: 2 },
+            { label: "RAM %", data: ramData, tension: 0.25, pointRadius: 0, borderWidth: 2 },
             { label: "DISK % (worst)", data: diskData, tension: 0.25, pointRadius: 0, borderWidth: 2 },
             { label: "TEMP °C", data: tempData, tension: 0.25, pointRadius: 0, borderWidth: 2 }
           ]
@@ -552,99 +557,152 @@ DASH_HTML = """
           responsive: true,
           maintainAspectRatio: false,
           animation: false,
-          plugins: { legend: { labels: { color: "rgba(255,255,255,0.75)" } } },
+          plugins: {
+            legend: { labels: { color: "rgba(255,255,255,.75)" } }
+          },
           scales: {
-            x: { ticks: { color: "rgba(255,255,255,0.55)", maxTicksLimit: 10 }, grid: { color: "rgba(255,255,255,0.08)" } },
-            y: { suggestedMin: 0, suggestedMax: 100, ticks: { color: "rgba(255,255,255,0.55)" }, grid: { color: "rgba(255,255,255,0.08)" } }
+            x: {
+              ticks: { color: "rgba(255,255,255,.55)", maxTicksLimit: 10 },
+              grid: { color: "rgba(255,255,255,.08)" }
+            },
+            y: {
+              beginAtZero: true,
+              ticks: { color: "rgba(255,255,255,.55)" },
+              grid: { color: "rgba(255,255,255,.08)" }
+            }
           }
         }
       });
     }
 
     async function updateChart(pc, rangeKey) {
-      const rows = await fetchStats(pc, rangeKey);  // newest first
-      const data = rows.slice().reverse();          // oldest -> newest
+      const data = await fetchStats(pc, rangeKey);
+      const labels = data.points.map(p => labelFromTs(p.ts));
+      const cpuData = data.points.map(p => p.cpu);
+      const ramData = data.points.map(p => p.ram);
+      const diskData = data.points.map(p => p.disk_percent);
+      const tempData = data.points.map(p => p.cpu_temp);
 
-      const labels   = data.map(r => labelFromTs(r.ts));
-      const cpuData  = data.map(r => (r.cpu ?? null));
-      const ramData  = data.map(r => (r.ram ?? null));
-      const diskData = data.map(r => (r.disk_percent ?? null));
-      const tempData = data.map(r => (r.cpu_temp ?? null));
+      if (!chart) {
+        buildChart(labels, cpuData, ramData, diskData, tempData);
+      } else {
+        chart.data.labels = labels;
+        chart.data.datasets[0].data = cpuData;
+        chart.data.datasets[1].data = ramData;
+        chart.data.datasets[2].data = diskData;
+        chart.data.datasets[3].data = tempData;
+        chart.update("none");
+      }
+    }
 
-      if (!chart) { buildChart(labels, cpuData, ramData, diskData, tempData); return; }
+    function setHealth(el, text, color) {
+      el.textContent = text || "—";
+      el.style.color = color || "#9aa4b2";
+    }
 
-      chart.data.labels = labels;
-      chart.data.datasets[0].data = cpuData;
-      chart.data.datasets[1].data = ramData;
-      chart.data.datasets[2].data = diskData;
-      chart.data.datasets[3].data = tempData;
-      chart.update();
+    function renderDrives(drives) {
+      if (!Array.isArray(drives) || drives.length === 0) {
+        drivesWrap.innerHTML = `<div class="sub">No drive data yet.</div>`;
+        return;
+      }
+
+      drivesWrap.innerHTML = drives.map(d => {
+        const pct = typeof d.percent === "number" ? d.percent.toFixed(1) : "0.0";
+        const used = typeof d.used_gb === "number" ? d.used_gb.toFixed(2) : "—";
+        const total = typeof d.total_gb === "number" ? d.total_gb.toFixed(2) : "—";
+        const mount = d.mount || "?";
+        return `
+          <div class="drive">
+            <div class="drive-head">
+              <strong>${mount}</strong>
+              <span>${pct}%</span>
+            </div>
+            <div class="meter"><div class="bar" data-p="${pct}"></div></div>
+            <div class="sub">${used} / ${total} GB</div>
+          </div>
+        `;
+      }).join("");
+      applyBars();
+    }
+
+    function renderRecent(rows) {
+      if (!Array.isArray(rows) || rows.length === 0) {
+        recentTable.innerHTML = `<tr><td colspan="6">No data yet.</td></tr>`;
+        return;
+      }
+
+      recentTable.innerHTML = rows.map(row => `
+        <tr>
+          <td>${row.ts ?? "—"}</td>
+          <td>${row.client_ts ?? "—"}</td>
+          <td>${typeof row.cpu === "number" ? row.cpu.toFixed(1) + "%" : "—"}</td>
+          <td>${typeof row.ram === "number" ? row.ram.toFixed(1) + "%" : "—"}</td>
+          <td>${typeof row.disk_percent === "number" ? row.disk_percent.toFixed(1) + "%" : "—"}</td>
+          <td>${typeof row.cpu_temp === "number" ? row.cpu_temp.toFixed(1) + "°C" : "—"}</td>
+        </tr>
+      `).join("");
     }
 
     async function updateCards(pc) {
-      const s = await fetchSummary(pc);
+      const data = await fetchSummary(pc);
 
-      // LIVE badge
-      const dot = document.getElementById("liveDot");
-      const text = document.getElementById("liveText");
-      dot.style.background = s.status_color;
-      dot.style.boxShadow = `0 0 16px ${s.status_color}`;
-      text.textContent = s.status_text;
+      lastServerTs = data.last_ts || null;
 
-      // Cards
-      document.getElementById("cpuVal").textContent = (s.cpu_display ?? "—") + "%";
-      document.getElementById("ramVal").textContent = (s.ram_display ?? "—") + "%";
-      document.getElementById("diskVal").textContent = (s.disk_percent_display ?? "—") + "%";
-      document.getElementById("diskSub").textContent =
-        `Total: ${s.disk_used_gb_display ?? "—"} GB used • ${s.disk_total_gb_display ?? "—"} GB total`;
-      document.getElementById("tempVal").textContent = (s.cpu_temp_display ?? "—") + "°C";
+      cpuValue.textContent = typeof data.cpu === "number" ? data.cpu.toFixed(1) + "%" : "—";
+      ramValue.textContent = typeof data.ram === "number" ? data.ram.toFixed(1) + "%" : "—";
+      diskValue.textContent = typeof data.disk_percent === "number" ? data.disk_percent.toFixed(1) + "%" : "—";
+      tempValue.textContent = typeof data.cpu_temp === "number" ? data.cpu_temp.toFixed(1) + "°C" : "—";
 
-      lastServerTs = s.latest_ts ?? null;
+      setHealth(cpuHealth, data.cpu_health, data.cpu_health_color);
+      setHealth(ramHealth, data.ram_health, data.ram_health_color);
+      setHealth(diskHealth, data.disk_health, data.disk_health_color);
+      setHealth(tempHealth, data.temp_health, data.temp_health_color);
+
+      liveText.textContent = data.status_text || "OFFLINE";
+      liveDot.style.background = data.status_color || "#ff4d6d";
+      liveDot.style.boxShadow = `0 0 16px ${data.status_color || "#ff4d6d"}`;
+
+      renderDrives(data.drives || []);
+      renderRecent(data.recent_rows || []);
     }
 
-    function makeURL(pc, rangeKey){
-      return `/?pc=${encodeURIComponent(pc)}&range=${encodeURIComponent(rangeKey)}`;
-    }
-
-    function onPCOrRangeChange() {
-      const pc = pcSelect.value;
-      const rangeKey = rangeSelect.value;
-      window.location = makeURL(pc, rangeKey);
-    }
-
-    pcSelect.addEventListener("change", onPCOrRangeChange);
-    rangeSelect.addEventListener("change", onPCOrRangeChange);
-
-    pauseBtn.addEventListener("click", ()=>{
+    pauseBtn.addEventListener("click", () => {
       isPaused = !isPaused;
       pauseBtn.textContent = isPaused ? "▶ Resume" : "⏸ Pause";
-      pauseBtn.dataset.on = isPaused ? "false" : "true";
     });
 
-    // UI FPS counter
-    (function fpsLoop(){
-      let frames = 0;
-      let last = performance.now();
+    pcSelect.addEventListener("change", () => {
+      const url = new URL(window.location.href);
+      url.searchParams.set("pc", pcSelect.value);
+      url.searchParams.set("range", rangeSelect.value);
+      window.location.href = url.toString();
+    });
 
-      function raf(t){
-        frames++;
-        if (t - last >= 1000){
-          fpsCounter.textContent = String(frames);
-          frames = 0;
-          last = t;
-        }
-        requestAnimationFrame(raf);
+    rangeSelect.addEventListener("change", () => {
+      const url = new URL(window.location.href);
+      url.searchParams.set("pc", pcSelect.value);
+      url.searchParams.set("range", rangeSelect.value);
+      window.location.href = url.toString();
+    });
+
+    let fpsFrames = 0;
+    let fpsLast = performance.now();
+    function fpsLoop(now) {
+      fpsFrames++;
+      if (now - fpsLast >= 1000) {
+        fpsCounter.textContent = fpsFrames.toString();
+        fpsFrames = 0;
+        fpsLast = now;
       }
-      requestAnimationFrame(raf);
-    })();
+      requestAnimationFrame(fpsLoop);
+    }
+    requestAnimationFrame(fpsLoop);
 
-    // "Last update: Xs ago" from server ts
-    function ageLoop(){
-      if (!lastServerTs){
+    function ageLoop() {
+      if (!lastServerTs) {
         ageCounter.textContent = "—";
         return;
       }
-      // lastServerTs is "YYYY-MM-DD HH:MM:SS" UTC
       const iso = lastServerTs.replace(" ", "T") + "Z";
       const dt = new Date(iso);
       const ageSec = Math.max(0, Math.floor((Date.now() - dt.getTime()) / 1000));
@@ -652,18 +710,23 @@ DASH_HTML = """
     }
     setInterval(ageLoop, 500);
 
-    const selectedPC = pcSelect.value;
-    const selectedRange = rangeSelect.value;
-
-    async function tick(){
-      if (isPaused) return;
-      await updateChart(selectedPC, selectedRange);
-      await updateCards(selectedPC);
+    async function tick() {
+      if (isPaused || ticking) return;
+      ticking = true;
+      try {
+        const pc = pcSelect.value;
+        const range = rangeSelect.value;
+        await updateChart(pc, range);
+        await updateCards(pc);
+      } catch (err) {
+        console.error("Tick failed:", err);
+      } finally {
+        ticking = false;
+      }
     }
 
-    // initial
-    updateChart(selectedPC, selectedRange);
-    updateCards(selectedPC);
+    applyBars();
+    tick();
     tickTimer = setInterval(tick, 5000);
   </script>
 </body>
@@ -689,24 +752,24 @@ def home():
     selected_range = range_key if range_key in valid_ranges else "1h"
 
     conn = db()
+    pc_list, selected_pc = get_selected_pc(conn, pc_param)
 
-    pcs = conn.execute(
+    latest = conn.execute(
         """
-        SELECT DISTINCT COALESCE(pc_name, notes, 'unknown') AS pc
+        SELECT ts, client_ts, cpu, ram, cpu_temp, disk_percent, disk_used_gb, disk_total_gb, drives_json
         FROM stats
-        WHERE COALESCE(pc_name, notes, 'unknown') IS NOT NULL
-        ORDER BY pc ASC
-        """
-    ).fetchall()
-    pc_list = [r["pc"] for r in pcs] if pcs else ["unknown"]
+        WHERE COALESCE(NULLIF(pc_name, ''), NULLIF(notes, ''), 'unknown') = ?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (selected_pc,),
+    ).fetchone()
 
-    selected_pc = pc_param if (pc_param and pc_param in pc_list) else pc_list[0]
-
-    rows = conn.execute(
+    recent_rows = conn.execute(
         """
-        SELECT ts,cpu,ram,cpu_temp,disk_percent,disk_used_gb,disk_total_gb,notes,drives_json
+        SELECT ts, client_ts, cpu, ram, cpu_temp, disk_percent
         FROM stats
-        WHERE COALESCE(pc_name, notes, 'unknown') = ?
+        WHERE COALESCE(NULLIF(pc_name, ''), NULLIF(notes, ''), 'unknown') = ?
         ORDER BY id DESC
         LIMIT 15
         """,
@@ -714,84 +777,53 @@ def home():
     ).fetchall()
     conn.close()
 
-    # Defaults
     status_text = "OFFLINE"
     status_color = "#ff4d6d"
+
+    cpu_value = "—"
+    ram_value = "—"
+    disk_value = "—"
+    temp_value = "—"
 
     cpu_health, cpu_health_color = ("—", "#9aa4b2")
     ram_health, ram_health_color = ("—", "#9aa4b2")
     disk_health, disk_health_color = ("—", "#9aa4b2")
     temp_health, temp_health_color = ("—", "#9aa4b2")
-
-    banner_show = False
-    banner_title = ""
-    banner_subtitle = ""
-
-    cpu_v = "—"
-    ram_v = "—"
-    disk_p = "—"
-    disk_used = "—"
-    disk_total = "—"
-    temp_v = "—"
-    ts_v = "—"
     drives = []
 
-    if rows:
-        latest = rows[0]
-        ts_v = latest["ts"]
-        drives = safe_load_drives(latest["drives_json"])
-
-        # Live/offline
+    if latest:
+        now = datetime.now(timezone.utc)
         try:
-            latest_dt = parse_ts_utc(latest["ts"])
-            age_seconds = (datetime.now(timezone.utc) - latest_dt).total_seconds()
-            is_live = age_seconds <= LIVE_WINDOW_SECONDS
+            age_sec = (now - parse_ts_utc(latest["ts"])).total_seconds()
+            if age_sec <= LIVE_WINDOW_SECONDS:
+                status_text = "LIVE"
+                status_color = "#38d996"
         except Exception:
-            is_live = False
+            pass
 
-        status_text = "LIVE" if is_live else "OFFLINE"
-        status_color = "#38d996" if is_live else "#ff4d6d"
+        cpu_value = f"{fmt1(latest['cpu'])}%"
+        ram_value = f"{fmt1(latest['ram'])}%"
+        disk_value = f"{fmt1(latest['disk_percent'])}%"
+        temp_value = f"{fmt1(latest['cpu_temp'])}°C"
 
         cpu_health, cpu_health_color = health_from_percent(latest["cpu"], CPU_WARN, CPU_CRIT)
         ram_health, ram_health_color = health_from_percent(latest["ram"], RAM_WARN, RAM_CRIT)
         disk_health, disk_health_color = health_from_percent(latest["disk_percent"], DISK_WARN, DISK_CRIT)
         temp_health, temp_health_color = health_from_temp_c(latest["cpu_temp"], TEMP_WARN_C, TEMP_CRIT_C)
-
-        crits = []
-        if cpu_health == "CRIT":
-            crits.append("CPU")
-        if ram_health == "CRIT":
-            crits.append("RAM")
-        if disk_health == "CRIT":
-            crits.append("DISK")
-        if temp_health == "CRIT":
-            crits.append("TEMP")
-
-        if crits:
-            banner_show = True
-            banner_title = "CRITICAL"
-            banner_subtitle = " • ".join(crits) + " above critical threshold"
-
-        cpu_v = fmt1(latest["cpu"])
-        ram_v = fmt1(latest["ram"])
-        disk_p = fmt1(latest["disk_percent"])
-        disk_used = fmt2(latest["disk_used_gb"])
-        disk_total = fmt2(latest["disk_total_gb"])
-        temp_v = fmt1(latest["cpu_temp"])
+        drives = safe_load_drives(latest["drives_json"])
 
     return render_template_string(
         DASH_HTML,
         pc_list=pc_list,
         selected_pc=selected_pc,
-        rows=rows,
-        drives=drives,
-
         range_options=range_options,
         selected_range=selected_range,
-
         status_text=status_text,
         status_color=status_color,
-
+        cpu_value=cpu_value,
+        ram_value=ram_value,
+        disk_value=disk_value,
+        temp_value=temp_value,
         cpu_health=cpu_health,
         cpu_health_color=cpu_health_color,
         ram_health=ram_health,
@@ -800,158 +832,226 @@ def home():
         disk_health_color=disk_health_color,
         temp_health=temp_health,
         temp_health_color=temp_health_color,
-
-        banner_show=banner_show,
-        banner_title=banner_title,
-        banner_subtitle=banner_subtitle,
-
-        cpu=cpu_v,
-        ram=ram_v,
-        disk_percent=disk_p,
-        disk_used_gb=disk_used,
-        disk_total_gb=disk_total,
-        cpu_temp=temp_v,
-        ts=ts_v,
+        drives=drives,
+        recent_rows=recent_rows,
     )
 
 
-@app.route("/api/ingest", methods=["POST"], strict_slashes=False)
+@app.post("/api/ingest")
 def ingest():
-    sent_key = request.headers.get("X-API-Key", "")
-    if sent_key != API_KEY:
-        return jsonify({"error": "unauthorized"}), 401
+    provided_key = request.headers.get("X-API-Key", "")
+    if provided_key != API_KEY:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
 
-    data = request.get_json(silent=True) or {}
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"ok": False, "error": "invalid_json"}), 400
 
-    cpu = data.get("cpu")
-    ram = data.get("ram")
-    cpu_temp = data.get("cpu_temp")
-    disk_percent = data.get("disk_percent")
-    disk_used_gb = data.get("disk_used_gb")
-    disk_total_gb = data.get("disk_total_gb")
+    pc_name = clean_text(data.get("pc_name")) or "unknown"
+    notes = clean_text(data.get("notes")) or pc_name
 
-    drives = data.get("drives")  # NEW list
-    drives_json = None
-    try:
-        if isinstance(drives, list):
-            drives_json = json.dumps(drives)
-    except Exception:
-        drives_json = None
+    cpu = clamp_num(data.get("cpu"), 0, 100)
+    ram = clamp_num(data.get("ram"), 0, 100)
+    gpu = clamp_num(data.get("gpu"), 0, 100)
+    cpu_temp = _to_float(data.get("cpu_temp"))
+    disk_percent = clamp_num(data.get("disk_percent"), 0, 100)
+    disk_used_gb = _to_float(data.get("disk_used_gb"))
+    disk_total_gb = _to_float(data.get("disk_total_gb"))
+    client_ts = validate_ts(data.get("client_ts"))
+    drives = normalize_drives(data.get("drives"))
 
-    pc_name = data.get("pc_name") or data.get("notes")
-    notes = data.get("notes") or pc_name
-
-    client_ts = data.get("client_ts")
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    server_ts = utc_now_str()
+    drives_json = json.dumps(drives, separators=(",", ":"))
 
     conn = db()
     conn.execute(
         """
-        INSERT INTO stats (ts,cpu,ram,cpu_temp,notes,pc_name,disk_percent,disk_used_gb,disk_total_gb,drives_json,client_ts)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?)
+        INSERT INTO stats (
+            ts, cpu, ram, gpu, notes, pc_name,
+            cpu_temp, disk_percent, disk_used_gb, disk_total_gb,
+            drives_json, client_ts
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (ts, cpu, ram, cpu_temp, notes, pc_name, disk_percent, disk_used_gb, disk_total_gb, drives_json, client_ts),
+        (
+            server_ts,
+            cpu,
+            ram,
+            gpu,
+            notes,
+            pc_name,
+            cpu_temp,
+            disk_percent,
+            disk_used_gb,
+            disk_total_gb,
+            drives_json,
+            client_ts,
+        ),
     )
     conn.commit()
     conn.close()
 
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "ts": server_ts})
 
 
 @app.get("/api/stats")
 def api_stats():
-    pc = request.args.get("pc", "").strip()
+    pc_param = request.args.get("pc", "").strip()
     range_key = request.args.get("range", "1h").strip()
-    if not pc:
-        return jsonify([])
-
-    # range -> cutoff timestamp
-    now = datetime.now(timezone.utc)
-    if range_key == "15m":
-        cutoff = now - timedelta(minutes=15)
-    elif range_key == "6h":
-        cutoff = now - timedelta(hours=6)
-    elif range_key == "24h":
-        cutoff = now - timedelta(hours=24)
-    else:
-        cutoff = now - timedelta(hours=1)
-
-    cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
 
     conn = db()
+    pc_list, selected_pc = get_selected_pc(conn, pc_param)
+
+    delta = get_range_delta(range_key)
+    threshold = (datetime.now(timezone.utc) - delta).strftime("%Y-%m-%d %H:%M:%S")
+
     rows = conn.execute(
         """
-        SELECT ts,cpu,ram,cpu_temp,disk_percent,disk_used_gb,disk_total_gb,notes
+        SELECT ts, client_ts, cpu, ram, cpu_temp, disk_percent
         FROM stats
-        WHERE COALESCE(pc_name, notes, 'unknown') = ?
+        WHERE COALESCE(NULLIF(pc_name, ''), NULLIF(notes, ''), 'unknown') = ?
           AND ts >= ?
-        ORDER BY id DESC
-        LIMIT 600
+        ORDER BY id ASC
+        LIMIT ?
         """,
-        (pc, cutoff_str),
+        (selected_pc, threshold, MAX_STATS_POINTS),
     ).fetchall()
     conn.close()
-    return jsonify([dict(r) for r in rows])
+
+    points = [
+        {
+            "ts": row["ts"],
+            "client_ts": row["client_ts"],
+            "cpu": _to_float(row["cpu"]),
+            "ram": _to_float(row["ram"]),
+            "cpu_temp": _to_float(row["cpu_temp"]),
+            "disk_percent": _to_float(row["disk_percent"]),
+        }
+        for row in rows
+    ]
+
+    return jsonify({"ok": True, "pc": selected_pc, "available_pcs": pc_list, "points": points})
 
 
 @app.get("/api/summary")
 def api_summary():
-    pc = request.args.get("pc", "").strip()
-    if not pc:
-        return jsonify({"error": "missing pc"}), 400
+    pc_param = request.args.get("pc", "").strip()
 
     conn = db()
+    pc_list, selected_pc = get_selected_pc(conn, pc_param)
+
     latest = conn.execute(
         """
-        SELECT ts,cpu,ram,cpu_temp,disk_percent,disk_used_gb,disk_total_gb,drives_json
+        SELECT ts, client_ts, cpu, ram, cpu_temp, disk_percent, disk_used_gb, disk_total_gb, drives_json
         FROM stats
-        WHERE COALESCE(pc_name, notes, 'unknown') = ?
+        WHERE COALESCE(NULLIF(pc_name, ''), NULLIF(notes, ''), 'unknown') = ?
         ORDER BY id DESC
         LIMIT 1
         """,
-        (pc,),
+        (selected_pc,),
     ).fetchone()
+
+    recent_rows = conn.execute(
+        """
+        SELECT ts, client_ts, cpu, ram, cpu_temp, disk_percent
+        FROM stats
+        WHERE COALESCE(NULLIF(pc_name, ''), NULLIF(notes, ''), 'unknown') = ?
+        ORDER BY id DESC
+        LIMIT 15
+        """,
+        (selected_pc,),
+    ).fetchall()
     conn.close()
 
-    if not latest:
+    status_text = "OFFLINE"
+    status_color = "#ff4d6d"
+
+    if latest:
+        try:
+            age_sec = (datetime.now(timezone.utc) - parse_ts_utc(latest["ts"])).total_seconds()
+            if age_sec <= LIVE_WINDOW_SECONDS:
+                status_text = "LIVE"
+                status_color = "#38d996"
+        except Exception:
+            pass
+
+        cpu_health, cpu_health_color = health_from_percent(latest["cpu"], CPU_WARN, CPU_CRIT)
+        ram_health, ram_health_color = health_from_percent(latest["ram"], RAM_WARN, RAM_CRIT)
+        disk_health, disk_health_color = health_from_percent(latest["disk_percent"], DISK_WARN, DISK_CRIT)
+        temp_health, temp_health_color = health_from_temp_c(latest["cpu_temp"], TEMP_WARN_C, TEMP_CRIT_C)
+
         return jsonify(
             {
-                "status_text": "OFFLINE",
-                "status_color": "#ff4d6d",
-                "cpu_display": "—",
-                "ram_display": "—",
-                "disk_percent_display": "—",
-                "disk_used_gb_display": "—",
-                "disk_total_gb_display": "—",
-                "cpu_temp_display": "—",
-                "latest_ts": None,
+                "ok": True,
+                "pc": selected_pc,
+                "available_pcs": pc_list,
+                "status_text": status_text,
+                "status_color": status_color,
+                "last_ts": latest["ts"],
+                "last_client_ts": latest["client_ts"],
+                "cpu": _to_float(latest["cpu"]),
+                "ram": _to_float(latest["ram"]),
+                "cpu_temp": _to_float(latest["cpu_temp"]),
+                "disk_percent": _to_float(latest["disk_percent"]),
+                "disk_used_gb": _to_float(latest["disk_used_gb"]),
+                "disk_total_gb": _to_float(latest["disk_total_gb"]),
+                "cpu_health": cpu_health,
+                "cpu_health_color": cpu_health_color,
+                "ram_health": ram_health,
+                "ram_health_color": ram_health_color,
+                "disk_health": disk_health,
+                "disk_health_color": disk_health_color,
+                "temp_health": temp_health,
+                "temp_health_color": temp_health_color,
+                "drives": safe_load_drives(latest["drives_json"]),
+                "recent_rows": [
+                    {
+                        "ts": row["ts"],
+                        "client_ts": row["client_ts"],
+                        "cpu": _to_float(row["cpu"]),
+                        "ram": _to_float(row["ram"]),
+                        "cpu_temp": _to_float(row["cpu_temp"]),
+                        "disk_percent": _to_float(row["disk_percent"]),
+                    }
+                    for row in recent_rows
+                ],
             }
         )
 
-    try:
-        age_seconds = (datetime.now(timezone.utc) - parse_ts_utc(latest["ts"])).total_seconds()
-        is_live = age_seconds <= LIVE_WINDOW_SECONDS
-    except Exception:
-        is_live = False
-
-    status_text = "LIVE" if is_live else "OFFLINE"
-    status_color = "#38d996" if is_live else "#ff4d6d"
-
     return jsonify(
         {
+            "ok": True,
+            "pc": selected_pc,
+            "available_pcs": pc_list,
             "status_text": status_text,
             "status_color": status_color,
-            "cpu_display": fmt1(latest["cpu"]),
-            "ram_display": fmt1(latest["ram"]),
-            "disk_percent_display": fmt1(latest["disk_percent"]),
-            "disk_used_gb_display": fmt2(latest["disk_used_gb"]),
-            "disk_total_gb_display": fmt2(latest["disk_total_gb"]),
-            "cpu_temp_display": fmt1(latest["cpu_temp"]),
-            "latest_ts": latest["ts"],
+            "last_ts": None,
+            "last_client_ts": None,
+            "cpu": None,
+            "ram": None,
+            "cpu_temp": None,
+            "disk_percent": None,
+            "disk_used_gb": None,
+            "disk_total_gb": None,
+            "cpu_health": "—",
+            "cpu_health_color": "#9aa4b2",
+            "ram_health": "—",
+            "ram_health_color": "#9aa4b2",
+            "disk_health": "—",
+            "disk_health_color": "#9aa4b2",
+            "temp_health": "—",
+            "temp_health_color": "#9aa4b2",
+            "drives": [],
+            "recent_rows": [],
         }
     )
 
 
 @app.get("/health")
 def health():
-    return jsonify({"status": "ok"})
+    return jsonify({"ok": True, "ts": utc_now_str()})
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=False)
